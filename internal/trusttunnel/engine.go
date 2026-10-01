@@ -21,9 +21,9 @@ import (
 
 var (
 	cmdInstance  *exec.Cmd
-	mu          sync.Mutex
-	expectedRun bool          // whether the engine is expected to be running
-	stopChan    chan struct{} // to signal supervisor loop to stop
+	mu           sync.Mutex
+	expectedRun  bool          // whether the engine is expected to be running
+	stopChan     chan struct{} // to signal supervisor loop to stop
 	isServerMode bool
 	restartDelay time.Duration
 )
@@ -699,7 +699,7 @@ func restartEngineFromDB() error {
 // containing the server endpoint address and obfuscation parameters.
 func GenerateExportToken(cfg *models.TrustTunnelConfig) string {
 	params := url.Values{}
-	
+
 	addr := cfg.ListenAddress
 	if cfg.PublicTlsPort > 0 {
 		host := "0.0.0.0"
@@ -708,7 +708,7 @@ func GenerateExportToken(cfg *models.TrustTunnelConfig) string {
 		}
 		addr = fmt.Sprintf("%s:%d", host, cfg.PublicTlsPort)
 	}
-	
+
 	params.Set("addr", addr)
 	params.Set("hostname", cfg.ServerHostname)
 	params.Set("transport", cfg.ForcedTransport)

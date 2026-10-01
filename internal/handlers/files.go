@@ -18,6 +18,7 @@ import (
 	"clever-connect/internal/logger"
 	"clever-connect/internal/models"
 	"clever-connect/internal/scheduler"
+	"clever-connect/internal/storageguard"
 	"clever-connect/internal/torrent"
 	anacrolixTorrent "github.com/anacrolix/torrent"
 	"github.com/gin-gonic/gin"
@@ -29,7 +30,8 @@ type FileItem struct {
 	Size      int64     `json:"size"`
 	ModTime   time.Time `json:"mod_time"`
 	Extension string    `json:"extension"`
-	S3Key     string    `json:"s3_key"` // non-empty when the file is archived in S3 object storage
+	S3Key     string    `json:"s3_key"` // non-empty when archived in S3 via the filecore registry
+	InS3      bool      `json:"in_s3"`  // backed by a Cellar backup (storage guard, streamable)
 }
 
 type FileHandler struct {
@@ -120,7 +122,7 @@ func (h *FileHandler) proxyToServer(c *gin.Context, method string, apiPath strin
 
 	// Overwrite local credentials with the actual remote server's Ehco client auth_token!
 	if remoteToken != "" {
-		req.Header.Set("Authorization", "Bearer " + remoteToken)
+		req.Header.Set("Authorization", "Bearer "+remoteToken)
 	}
 
 	// Execute proxy request to remote server
@@ -349,6 +351,55 @@ func (h *FileHandler) ListDirectory(c *gin.Context) {
 	h.mergeS3VirtualFiles(safePath, virtualFiles)
 
 	// Merge virtual files with physical ones
+	// Also surface files that exist ONLY in S3 (offloaded + evicted by the
+	// storage guard) so they remain browsable — they stream from Cellar.
+	if storageguard.Enabled() {
+		var offloaded []models.TorrentFileOffload
+		if err := db.DB.Where("uploaded = ? AND evicted_local = ?", true, true).
+			Find(&offloaded).Error; err == nil {
+			for _, row := range offloaded {
+				rowPath := filepath.Clean(row.FilePath)
+				parentDir := filepath.Dir(rowPath)
+				name := filepath.Base(rowPath)
+
+				if parentDir == safePath {
+					if existing, ok := virtualFiles[name]; ok {
+						existing.InS3 = true
+						virtualFiles[name] = existing
+						continue
+					}
+					virtualFiles[name] = FileItem{
+						Name:      name,
+						IsDir:     false,
+						Size:      row.Size,
+						ModTime:   row.UpdatedAt,
+						Extension: filepath.Ext(name),
+						InS3:      true,
+					}
+				} else if strings.HasPrefix(parentDir, safePath+string(filepath.Separator)) {
+					if rel, relErr := filepath.Rel(safePath, parentDir); relErr == nil && rel != "." && rel != ".." {
+						parts := strings.Split(filepath.ToSlash(rel), "/")
+						if len(parts) > 0 && parts[0] != "" {
+							dirName := parts[0]
+							if existing, ok := virtualFiles[dirName]; ok {
+								existing.InS3 = true
+								virtualFiles[dirName] = existing
+							} else {
+								virtualFiles[dirName] = FileItem{
+									Name:    dirName,
+									IsDir:   true,
+									ModTime: time.Now(),
+									InS3:    true,
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Merge virtual files with physical ones
 	for _, vf := range virtualFiles {
 		foundIdx := -1
 		for idx, pf := range files {
@@ -538,9 +589,10 @@ func (h *FileHandler) StreamOrDownload(c *gin.Context) {
 		}
 	}
 
-	// 2. If the file is mirrored in S3 object storage, stream it straight from
-	// there with HTTP Range passthrough (sub-second seeking, zero disk I/O).
-	// This is the fast path on Clever Cloud where local disk is ephemeral.
+	// 2. If the file is mirrored in S3 object storage via the filecore
+	// registry, stream it straight from there with HTTP Range passthrough
+	// (sub-second seeking, zero disk I/O). This is the fast path on Clever
+	// Cloud where local disk is ephemeral.
 	if reg, ok := filecore.LookupRegistryByPath(safePath); ok {
 		if filecore.IsS3Stored(reg) {
 			disposition := ""
@@ -566,9 +618,22 @@ func (h *FileHandler) StreamOrDownload(c *gin.Context) {
 		}
 	}
 
-	// 3. Fall back to standard disk file streaming (either non-torrent file, or fully completed torrent file)
+	// 3. Fall back to standard disk file streaming (either non-torrent file,
+	// or fully completed torrent file). When the local copy was evicted by
+	// the storage guard but a Cellar backup exists, stream it straight from
+	// S3 with full Range support.
 	file, err := os.Open(safePath)
 	if err != nil {
+		if storageguard.Enabled() {
+			if reader, _, serr := storageguard.OpenS3Reader(safePath); serr == nil {
+				if c.Query("download") == "true" {
+					c.Header("Content-Disposition", "attachment; filename=\""+filepath.Base(safePath)+"\"")
+				}
+				http.ServeContent(c.Writer, c.Request, filepath.Base(safePath), time.Time{}, reader)
+				_ = reader.Close()
+				return
+			}
+		}
 		c.JSON(http.StatusNotFound, gin.H{"error": "File not found"})
 		return
 	}
@@ -616,6 +681,22 @@ func (h *FileHandler) RawDownload(c *gin.Context) {
 
 	file, err := os.Open(safePath)
 	if err != nil {
+		// The local copy may have been evicted to S3 by the storage guard —
+		// stream the raw bytes from Cellar instead of failing with 404.
+		if storageguard.Enabled() {
+			if reader, size, serr := storageguard.OpenS3Reader(safePath); serr == nil {
+				defer func() { _ = reader.Close() }()
+				c.Header("Content-Description", "File Transfer")
+				c.Header("Content-Type", "application/octet-stream")
+				c.Header("Content-Disposition", "attachment; filename=\""+filepath.Base(safePath)+"\"")
+				c.Header("Content-Length", fmt.Sprintf("%d", size))
+				c.Header("Expires", "0")
+				c.Header("Cache-Control", "must-revalidate")
+				c.Header("Pragma", "public")
+				_, _ = io.Copy(c.Writer, reader)
+				return
+			}
+		}
 		c.JSON(http.StatusNotFound, gin.H{"error": "File not found"})
 		return
 	}
@@ -627,8 +708,6 @@ func (h *FileHandler) RawDownload(c *gin.Context) {
 		return
 	}
 
-	// Set headers for raw download
-	c.Header("Content-Description", "File Transfer")
 	c.Header("Content-Type", "application/octet-stream")
 	c.Header("Content-Disposition", "attachment; filename=\""+filepath.Base(safePath)+"\"")
 	c.Header("Content-Length", fmt.Sprintf("%d", stat.Size()))
@@ -781,6 +860,12 @@ func (h *FileHandler) DeleteItem(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete item", "details": err.Error()})
 			return
 		}
+	}
+
+	// Also remove any Cellar objects / ledger rows tied to this path so
+	// evicted copies do not linger in the bucket (or ghost into listings).
+	if storageguard.Enabled() {
+		go storageguard.PurgeLocalPathFromS3(safePath)
 	}
 
 	logger.Info("Files", "File system item deleted successfully", "path", req.Path, "ip", c.ClientIP())
@@ -1282,12 +1367,12 @@ type FileInfoResponse struct {
 	// Active torrent provenance, when the file belongs to a torrent being
 	// downloaded/seeded on this container.
 	Torrent *struct {
-		InfoHash      string  `json:"info_hash"`
-		Name          string  `json:"name"`
-		Length        int64   `json:"length"`
-		BytesDone     int64   `json:"bytes_completed"`
-		Progress      float64 `json:"progress"`
-		Downloading   bool    `json:"downloading"`
+		InfoHash    string  `json:"info_hash"`
+		Name        string  `json:"name"`
+		Length      int64   `json:"length"`
+		BytesDone   int64   `json:"bytes_completed"`
+		Progress    float64 `json:"progress"`
+		Downloading bool    `json:"downloading"`
 	} `json:"torrent,omitempty"`
 
 	// Source is a human-readable label of the authoritative location:
@@ -1322,11 +1407,11 @@ func (h *FileHandler) FileInfo(c *gin.Context) {
 	rel = "/" + filepath.ToSlash(filepath.Clean("/"+rel))
 
 	resp := FileInfoResponse{
-		DiskPath:      safePath,
-		RelativePath:  rel,
-		S3Key:         "",
-		S3Present:     false,
-		Source:        "missing",
+		DiskPath:     safePath,
+		RelativePath: rel,
+		S3Key:        "",
+		S3Present:    false,
+		Source:       "missing",
 	}
 
 	// 1. Physical local-disk presence.

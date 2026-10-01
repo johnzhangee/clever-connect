@@ -14,6 +14,7 @@ import (
 	"clever-connect/internal/filecore"
 	"clever-connect/internal/logger"
 	"clever-connect/internal/models"
+	"clever-connect/internal/storageguard"
 
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
@@ -73,7 +74,13 @@ func Init() error {
 	}
 
 	// Auto-migrate the GORM TorrentJob and TorrentConfig models
-	if err := db.DB.AutoMigrate(&models.TorrentJob{}, &models.TorrentConfig{}); err != nil {
+	if err := db.DB.AutoMigrate(
+		&models.TorrentJob{},
+		&models.TorrentConfig{},
+		&models.StorageConfig{},
+		&models.TorrentFileOffload{},
+		&models.StorageLog{},
+	); err != nil {
 		return fmt.Errorf("failed to migrate torrent DB tables: %w", err)
 	}
 
@@ -184,9 +191,14 @@ func Init() error {
 	var jobs []models.TorrentJob
 	if err := db.DB.Find(&jobs).Error; err == nil {
 		for _, job := range jobs {
-			// Skip torrents that have been fully archived to S3 — their local
-			// files were removed, so re-adding them would re-download everything.
-			if job.Status == "completed" {
+			// Fully offloaded torrents live only in S3 — never re-add them to
+			// the client, or it would re-download every evicted byte.
+			// Completed torrents whose local files were stripped by the
+			// filecore S3 pipeline are in the same boat — unless the storage
+			// guard still has an upload or restore in flight, in which case
+			// the torrent resumes in a normal state.
+			if job.OffloadStatus == "offloaded" ||
+				(job.Status == "completed" && job.OffloadStatus == "") {
 				continue
 			}
 			if job.MagnetURI != "" {
@@ -400,29 +412,29 @@ func (m *TorrentManager) updateStats(persistDB bool) {
 				} else {
 					job.Status = "downloading"
 
-				// Per-file pipeline: as each individual torrent file finishes
-				// downloading, launch the inline synchronous S3 archiver so the
-				// file is pushed to object storage the instant it completes —
-				// BEFORE Clever Cloud can recycle the container and wipe the
-				// ephemeral download disk. The archiver uploads → punches the
-				// local blocks → chains the Telegram upload, and falls back to
-				// a retryable scheduler job only on failure. The in-memory
-				// registeredFiles map guards against duplicate submissions
-				// within a session.
-				if filecore.IsS3Enabled() {
-					for _, f := range t.Files() {
-						if f.Length() > 0 && f.BytesCompleted() >= f.Length() {
-							fileKey := infoHash + ":" + f.Path()
-							if !m.registeredFiles[fileKey] {
-								m.registeredFiles[fileKey] = true
-								// Bounded by archiveSem; never holds the
-								// manager mutex, so it cannot deadlock the stats
-								// loop that is currently holding it.
-								go m.archiveTorrentFileInline(job.InfoHash, job.SaveDirectory, f.Path(), 0)
+					// Per-file pipeline: as each individual torrent file finishes
+					// downloading, launch the inline synchronous S3 archiver so the
+					// file is pushed to object storage the instant it completes —
+					// BEFORE Clever Cloud can recycle the container and wipe the
+					// ephemeral download disk. The archiver uploads → punches the
+					// local blocks → chains the Telegram upload, and falls back to
+					// a retryable scheduler job only on failure. The in-memory
+					// registeredFiles map guards against duplicate submissions
+					// within a session.
+					if filecore.IsS3Enabled() {
+						for _, f := range t.Files() {
+							if f.Length() > 0 && f.BytesCompleted() >= f.Length() {
+								fileKey := infoHash + ":" + f.Path()
+								if !m.registeredFiles[fileKey] {
+									m.registeredFiles[fileKey] = true
+									// Bounded by archiveSem; never holds the
+									// manager mutex, so it cannot deadlock the stats
+									// loop that is currently holding it.
+									go m.archiveTorrentFileInline(job.InfoHash, job.SaveDirectory, f.Path(), 0)
+								}
 							}
 						}
 					}
-				}
 				}
 			}
 			db.DB.Save(&job)
@@ -587,6 +599,12 @@ func (m *TorrentManager) DeleteTorrent(infoHash string, deleteFiles bool) {
 			_ = os.Remove(job.TorrentPath)
 		}
 		db.DB.Delete(&job)
+
+		// When deleting with data, purge any S3 objects and ledger rows too,
+		// otherwise the offloaded copies would orphan in the Cellar bucket.
+		if deleteFiles {
+			_ = storageguard.PurgeTorrentData(infoHash)
+		}
 	}
 }
 
@@ -614,6 +632,21 @@ func copyFile(src, dst string) error {
 // Client returns the underlying client instance
 func (m *TorrentManager) Client() *torrent.Client {
 	return m.client
+}
+
+// Torrents exposes the live torrent list (storage guard provider bridge).
+func (m *TorrentManager) Torrents() []*torrent.Torrent {
+	return m.client.Torrents()
+}
+
+// TorrentByHash finds a live torrent by its hex info hash (nil if absent).
+func (m *TorrentManager) TorrentByHash(infoHash string) *torrent.Torrent {
+	for _, t := range m.client.Torrents() {
+		if t.InfoHash().HexString() == infoHash {
+			return t
+		}
+	}
+	return nil
 }
 
 // ApplyFilePriorities parses the selected files JSON string and sets the torrent file priorities
