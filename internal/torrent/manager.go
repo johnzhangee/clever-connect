@@ -14,6 +14,7 @@ import (
 	"clever-connect/internal/filecore"
 	"clever-connect/internal/logger"
 	"clever-connect/internal/models"
+	"clever-connect/internal/storageguard"
 
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
@@ -70,7 +71,13 @@ func Init() error {
 	}
 
 	// Auto-migrate the GORM TorrentJob and TorrentConfig models
-	if err := db.DB.AutoMigrate(&models.TorrentJob{}, &models.TorrentConfig{}); err != nil {
+	if err := db.DB.AutoMigrate(
+		&models.TorrentJob{},
+		&models.TorrentConfig{},
+		&models.StorageConfig{},
+		&models.TorrentFileOffload{},
+		&models.StorageLog{},
+	); err != nil {
 		return fmt.Errorf("failed to migrate torrent DB tables: %w", err)
 	}
 
@@ -163,6 +170,11 @@ func Init() error {
 	var jobs []models.TorrentJob
 	if err := db.DB.Find(&jobs).Error; err == nil {
 		for _, job := range jobs {
+			// Fully offloaded torrents live only in S3 — never re-add them to
+			// the client, or it would happily re-download every evicted byte.
+			if job.OffloadStatus == "offloaded" {
+				continue
+			}
 			if job.MagnetURI != "" {
 				t, err := client.AddMagnet(job.MagnetURI)
 				if err == nil {
@@ -516,6 +528,12 @@ func (m *TorrentManager) DeleteTorrent(infoHash string, deleteFiles bool) {
 			_ = os.Remove(job.TorrentPath)
 		}
 		db.DB.Delete(&job)
+
+		// When deleting with data, purge any S3 objects and ledger rows too,
+		// otherwise the offloaded copies would orphan in the Cellar bucket.
+		if deleteFiles {
+			_ = storageguard.PurgeTorrentData(infoHash)
+		}
 	}
 }
 
@@ -543,6 +561,21 @@ func copyFile(src, dst string) error {
 // Client returns the underlying client instance
 func (m *TorrentManager) Client() *torrent.Client {
 	return m.client
+}
+
+// Torrents exposes the live torrent list (storage guard provider bridge).
+func (m *TorrentManager) Torrents() []*torrent.Torrent {
+	return m.client.Torrents()
+}
+
+// TorrentByHash finds a live torrent by its hex info hash (nil if absent).
+func (m *TorrentManager) TorrentByHash(infoHash string) *torrent.Torrent {
+	for _, t := range m.client.Torrents() {
+		if t.InfoHash().HexString() == infoHash {
+			return t
+		}
+	}
+	return nil
 }
 
 // ApplyFilePriorities parses the selected files JSON string and sets the torrent file priorities

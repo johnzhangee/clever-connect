@@ -265,7 +265,7 @@ func generateClientTOML(cfg *models.TrustTunnelConfig) error {
 	}
 
 	// Determine skip_verification and certificate content
-	skipVerification := false
+	skipVerification := cfg.SkipTlsVerify
 	certContent := cfg.TlsServerCert
 	if certContent == "" {
 		certContent = defaultDummyCert
@@ -315,12 +315,30 @@ func generateClientTOML(cfg *models.TrustTunnelConfig) error {
 
 	resolvedConnectAddr := ResolveConnectAddress(cfg.ConnectAddress, cfg.ServerHostname)
 
+	dnsUpstreamsStr := ""
+	if cfg.DnsUpstreams != "" {
+		var servers []string
+		for _, s := range strings.Split(cfg.DnsUpstreams, ",") {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				continue
+			}
+			if !strings.Contains(s, ":") {
+				s = s + ":53"
+			}
+			servers = append(servers, fmt.Sprintf(`"%s"`, s))
+		}
+		if len(servers) > 0 {
+			dnsUpstreamsStr = fmt.Sprintf("\ndns_upstreams = [%s]", strings.Join(servers, ", "))
+		}
+	}
+
 	clientTOML := fmt.Sprintf(`vpn_mode = "general"
 killswitch_enabled = %t
 
 [endpoint]
 hostname = "%s"
-addresses = ["%s"]
+addresses = ["%s"]%s
 username = "%s"
 password = "%s"
 upstream_protocol = "%s"
@@ -339,6 +357,7 @@ address = "127.0.0.1:%d"
 		cfg.KillSwitchEnabled,
 		hostname,
 		resolvedConnectAddr,
+		dnsUpstreamsStr,
 		cfg.ClientUsername,
 		cfg.ClientPassword,
 		upstreamProtocol,
@@ -681,6 +700,8 @@ func GenerateExportToken(cfg *models.TrustTunnelConfig) string {
 	params.Set("prefix", cfg.ClientRandomPrefix)
 	params.Set("h2win", fmt.Sprintf("%d", cfg.H2InitialStreamWindowSize))
 	params.Set("timeout", fmt.Sprintf("%d", cfg.TlsHandshakeTimeoutSecs))
+	params.Set("skip_verify", fmt.Sprintf("%t", cfg.SkipTlsVerify))
+	params.Set("dns_upstreams", cfg.DnsUpstreams)
 
 	// Encode user credentials if any exist
 	var users []models.TrustTunnelUser

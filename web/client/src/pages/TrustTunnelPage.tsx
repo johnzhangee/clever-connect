@@ -51,6 +51,8 @@ export const TrustTunnelPage: React.FC = () => {
   const [clientUsername, setClientUsername] = useState('');
   const [clientPassword, setClientPassword] = useState('');
   const [tlsServerCert, setTlsServerCert] = useState('');
+  const [skipTlsVerify, setSkipTlsVerify] = useState(false);
+  const [dnsUpstreams, setDnsUpstreams] = useState('');
 
   // Token Import
   const [importTokenStr, setImportTokenStr] = useState('');
@@ -85,6 +87,8 @@ export const TrustTunnelPage: React.FC = () => {
       setClientUsername(config.client_username || '');
       setClientPassword(config.client_password || '');
       setTlsServerCert(config.tls_server_cert || '');
+      setSkipTlsVerify(config.skip_tls_verify || false);
+      setDnsUpstreams(config.dns_upstreams || '');
     }
   }, [config]);
 
@@ -136,6 +140,8 @@ export const TrustTunnelPage: React.FC = () => {
       client_username: clientUsername,
       client_password: clientPassword,
       tls_server_cert: tlsServerCert,
+      skip_tls_verify: skipTlsVerify,
+      dns_upstreams: dnsUpstreams,
       is_active: config?.is_active || false
     });
   };
@@ -362,7 +368,7 @@ export const TrustTunnelPage: React.FC = () => {
               </div>
             </div>
 
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 16 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
               <div>
                 <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'var(--color-brand-muted)', marginBottom: 6, textTransform: 'uppercase' }}>Server Hostname / SNI Domain Override</label>
                 <input
@@ -378,6 +384,25 @@ export const TrustTunnelPage: React.FC = () => {
                     background: 'var(--color-brand-card)',
                     color: 'var(--color-brand-heading)',
                     fontSize: 13
+                  }}
+                />
+              </div>
+              <div>
+                <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'var(--color-brand-muted)', marginBottom: 6, textTransform: 'uppercase' }}>DNS Upstream Servers (comma-separated)</label>
+                <input
+                  type="text"
+                  value={dnsUpstreams}
+                  onChange={(e) => setDnsUpstreams(e.target.value)}
+                  placeholder="e.g. 8.8.8.8, 1.1.1.1"
+                  style={{
+                    width: '100%',
+                    padding: '10px 12px',
+                    borderRadius: 8,
+                    border: '1px solid var(--color-brand-border)',
+                    background: 'var(--color-brand-card)',
+                    color: 'var(--color-brand-heading)',
+                    fontSize: 13,
+                    fontFamily: 'Fira Code'
                   }}
                 />
               </div>
@@ -585,17 +610,32 @@ export const TrustTunnelPage: React.FC = () => {
                     />
                   </div>
 
-                  <div style={{ gridColumn: 'span 2', display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 }}>
-                    <input
-                      type="checkbox"
-                      id="killSwitchEnabled"
-                      checked={killSwitchEnabled}
-                      onChange={(e) => setKillSwitchEnabled(e.target.checked)}
-                      style={{ width: 16, height: 16, cursor: 'pointer' }}
-                    />
-                    <label htmlFor="killSwitchEnabled" style={{ fontSize: 13, fontWeight: 500, color: 'var(--color-brand-heading)', cursor: 'pointer' }}>
-                      Enable Local Connection Kill-Switch (Prevent Leaks on drops)
-                    </label>
+                  <div style={{ gridColumn: 'span 2', display: 'flex', flexDirection: 'column', gap: 12, marginTop: 8 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <input
+                        type="checkbox"
+                        id="skipTlsVerify"
+                        checked={skipTlsVerify}
+                        onChange={(e) => setSkipTlsVerify(e.target.checked)}
+                        style={{ width: 16, height: 16, cursor: 'pointer' }}
+                      />
+                      <label htmlFor="skipTlsVerify" style={{ fontSize: 13, fontWeight: 500, color: 'var(--color-brand-heading)', cursor: 'pointer' }}>
+                        Skip TLS Verification (Recommended for custom or self-signed certs)
+                      </label>
+                    </div>
+
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <input
+                        type="checkbox"
+                        id="killSwitchEnabled"
+                        checked={killSwitchEnabled}
+                        onChange={(e) => setKillSwitchEnabled(e.target.checked)}
+                        style={{ width: 16, height: 16, cursor: 'pointer' }}
+                      />
+                      <label htmlFor="killSwitchEnabled" style={{ fontSize: 13, fontWeight: 500, color: 'var(--color-brand-heading)', cursor: 'pointer' }}>
+                        Enable Local Connection Kill-Switch (Prevent Leaks on drops)
+                      </label>
+                    </div>
                   </div>
                 </div>
               )}

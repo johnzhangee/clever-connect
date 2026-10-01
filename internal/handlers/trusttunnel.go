@@ -81,6 +81,8 @@ func (h *TrustTunnelHandler) SaveConfig(c *gin.Context) {
 		ClientUsername          string `json:"client_username"`
 		ClientPassword          string `json:"client_password"`
 		TlsServerCert           string `json:"tls_server_cert"`
+		SkipTlsVerify           bool   `json:"skip_tls_verify"`
+		DnsUpstreams            string `json:"dns_upstreams"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -147,6 +149,8 @@ func (h *TrustTunnelHandler) SaveConfig(c *gin.Context) {
 	ttCfg.ClientUsername = input.ClientUsername
 	ttCfg.ClientPassword = input.ClientPassword
 	ttCfg.TlsServerCert = input.TlsServerCert
+	ttCfg.SkipTlsVerify = input.SkipTlsVerify
+	ttCfg.DnsUpstreams = input.DnsUpstreams
 
 	if err := db.DB.Save(&ttCfg).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save configuration"})
@@ -443,6 +447,14 @@ func (h *TrustTunnelHandler) ImportToken(c *gin.Context) {
 	}
 	if cert, ok := params["cert"]; ok {
 		ttCfg.TlsServerCert = cert
+	}
+	if skipVerify, ok := params["skip_verify"]; ok {
+		if v, err := strconv.ParseBool(skipVerify); err == nil {
+			ttCfg.SkipTlsVerify = v
+		}
+	}
+	if dns, ok := params["dns_upstreams"]; ok {
+		ttCfg.DnsUpstreams = dns
 	}
 
 	if err := db.DB.Save(&ttCfg).Error; err != nil {

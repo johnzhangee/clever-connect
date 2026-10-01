@@ -49,6 +49,8 @@ type TrustTunnelConfig struct {
 	ClientUsername string `json:"client_username"`
 	ClientPassword string `json:"client_password"`
 	TlsServerCert  string `json:"tls_server_cert"`
+	SkipTlsVerify  bool   `json:"skip_tls_verify" gorm:"default:false"`
+	DnsUpstreams   string `json:"dns_upstreams" gorm:"default:''"`
 }
 
 // TrustTunnelUser stores client authentication credentials for the

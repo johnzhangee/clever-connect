@@ -22,6 +22,8 @@ export interface TrustTunnelConfig {
   client_username?: string;
   client_password?: string;
   tls_server_cert?: string;
+  skip_tls_verify?: boolean;
+  dns_upstreams?: string;
   UpdatedAt?: string;
 }
 

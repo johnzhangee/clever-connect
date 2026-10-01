@@ -20,6 +20,7 @@ import (
 	"clever-connect/internal/scheduler"
 	"clever-connect/internal/soroush"
 	"clever-connect/internal/spotify"
+	"clever-connect/internal/storageguard"
 	"clever-connect/internal/telegram"
 	"clever-connect/internal/torrent"
 	"clever-connect/internal/trusttunnel"
@@ -86,6 +87,12 @@ func main() {
 			logger.Error("Torrent", "Failed to initialize torrent manager", "error", err)
 		} else {
 			defer torrent.Manager.Close()
+
+			// Seed the smart storage config and start the Storage Guard
+			// (torrent offloading to the Clever Cellar S3 bucket with disk
+			// watermarks, stream batches, eviction and restore support).
+			storageguard.Init()
+			storageguard.Start(torrent.Manager)
 		}
 
 		// Initialize YouTube Download Engine
@@ -246,6 +253,7 @@ func main() {
 	fileHandler := handlers.NewFileHandler(cfg)
 	leechHandler := handlers.NewLeechHandler(cfg)
 	torrentHandler := handlers.NewTorrentHandler(cfg)
+	storageHandler := handlers.NewStorageHandler()
 	youtubeHandler := handlers.NewYouTubeHandler(cfg)
 	spotifyHandler := handlers.NewSpotifyHandler(cfg)
 	telegramHandler := handlers.NewTelegramHandler(cfg)
@@ -409,10 +417,10 @@ func main() {
 			protected.POST("/v2ray/warp/config", warpHandler.SaveConfig)
 			protected.GET("/v2ray/warp/accounts", warpHandler.ListAccounts)
 			protected.POST("/v2ray/warp/accounts", warpHandler.AddAccount)
-			protected.POST("/v2ray/warp/accounts/verify", warpHandler.VerifyLicenseKey)         // 4-stage key diagnostic — BEFORE :id routes
+			protected.POST("/v2ray/warp/accounts/verify", warpHandler.VerifyLicenseKey) // 4-stage key diagnostic — BEFORE :id routes
 			protected.DELETE("/v2ray/warp/accounts/:id", warpHandler.DeleteAccount)
 			protected.POST("/v2ray/warp/accounts/:id/activate", warpHandler.SetActiveAccount)
-			protected.POST("/v2ray/warp/accounts/:id/verify", warpHandler.VerifyAccount)        // live account health check
+			protected.POST("/v2ray/warp/accounts/:id/verify", warpHandler.VerifyAccount) // live account health check
 			protected.POST("/v2ray/warp/scan", warpHandler.StartScan)
 			protected.POST("/v2ray/warp/scan/stop", warpHandler.StopScan)
 			protected.GET("/v2ray/warp/scan/events", warpHandler.GetScanEvents)
@@ -488,6 +496,14 @@ func main() {
 			protected.POST("/torrent/select-files", torrentHandler.SelectTorrentFiles)
 			protected.GET("/torrent/config", torrentHandler.GetConfig)
 			protected.POST("/torrent/config", torrentHandler.SaveConfig)
+
+			// Smart Storage Guard (Cellar/S3 offloading) API Endpoints
+			protected.GET("/storage/status", storageHandler.GetStatus)
+			protected.GET("/storage/config", storageHandler.GetConfig)
+			protected.POST("/storage/config", storageHandler.SaveConfig)
+			protected.GET("/storage/logs", storageHandler.GetLogs)
+			protected.POST("/storage/restore/:hash", storageHandler.RestoreTorrent)
+			protected.POST("/storage/reoffload/:hash", storageHandler.ReoffloadTorrent)
 
 			// YouTube Downloader API Endpoints
 			protected.POST("/youtube/info", youtubeHandler.FetchInfo)

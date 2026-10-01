@@ -149,24 +149,36 @@ type LeechJob struct {
 
 // TorrentJob tracks BitTorrent tasks
 type TorrentJob struct {
-	InfoHash      string    `gorm:"primaryKey" json:"info_hash"`
-	Name          string    `json:"name"`
-	MagnetURI     string    `gorm:"type:text" json:"magnet_uri"`
-	TorrentPath   string    `json:"torrent_path"` // Local path to saved .torrent
-	SaveDirectory string    `json:"save_directory"`
-	Status        string    `json:"status" gorm:"default:'downloading'"` // downloading, paused, completed, seeding, error
-	TotalBytes    int64     `json:"total_bytes"`
-	Downloaded    int64     `json:"downloaded"`
-	Uploaded      int64     `json:"uploaded"`
-	Progress      float64   `json:"progress"`
-	DownloadSpeed float64   `json:"download_speed"` // MB/s
-	UploadSpeed   float64   `json:"upload_speed"`   // MB/s
-	Peers         int       `json:"peers"`
-	SelectedFiles string    `gorm:"type:text" json:"selected_files"` // JSON array of selected file indices
-	ErrorMessage  string    `json:"error_message"`
-	FileExists    bool      `gorm:"-" json:"file_exists"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	InfoHash      string  `gorm:"primaryKey" json:"info_hash"`
+	Name          string  `json:"name"`
+	MagnetURI     string  `gorm:"type:text" json:"magnet_uri"`
+	TorrentPath   string  `json:"torrent_path"` // Local path to saved .torrent
+	SaveDirectory string  `json:"save_directory"`
+	Status        string  `json:"status" gorm:"default:'downloading'"` // downloading, paused, completed, seeding, error
+	TotalBytes    int64   `json:"total_bytes"`
+	Downloaded    int64   `json:"downloaded"`
+	Uploaded      int64   `json:"uploaded"`
+	Progress      float64 `json:"progress"`
+	DownloadSpeed float64 `json:"download_speed"` // MB/s
+	UploadSpeed   float64 `json:"upload_speed"`   // MB/s
+	Peers         int     `json:"peers"`
+	SelectedFiles string  `gorm:"type:text" json:"selected_files"` // JSON array of selected file indices
+	ErrorMessage  string  `json:"error_message"`
+	FileExists    bool    `gorm:"-" json:"file_exists"`
+
+	// ── Smart S3 offload fields (Storage Guard) ──
+	// OffloadStatus: "" (no offload), "uploading" (S3 upload in progress),
+	// "uploaded" (fully uploaded, files still local), "offloaded" (uploaded and
+	// local copies removed), "failed" (last upload attempt failed), "restoring"
+	RestoreStatus  string    `json:"restore_status" gorm:"default:''"` // "", "restoring", "restored"
+	StreamMode     bool      `json:"stream_mode" gorm:"default:false"`
+	OffloadStatus  string    `json:"offload_status" gorm:"default:''"`
+	OffloadedFiles int       `json:"offloaded_files" gorm:"default:0"` // number of files secured in S3
+	OffloadedBytes int64     `json:"offloaded_bytes" gorm:"default:0"`
+	UploadSpeedS3  float64   `json:"upload_speed_s3"` // MB/s to Cellar/S3
+	PausedByGuard  bool      `json:"paused_by_guard" gorm:"default:false"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 // TelegramConfig stores the Telegram bot configuration, persisted in the database.
@@ -382,6 +394,67 @@ type FileRegistry struct {
 	TgFileID    int64     `gorm:"index" json:"tg_file_id"`
 	TorrentHash string    `gorm:"type:varchar(40);index" json:"torrent_hash"`
 	CreatedAt   time.Time `json:"created_at"`
+
+	// ── S3 offload fields (Storage Guard) ──
+	S3Key string `json:"s3_key" gorm:"type:varchar(512)"`
+	InS3  bool   `json:"in_s3" gorm:"default:false"`
+}
+
+// StorageConfig stores admin-configurable smart storage management settings.
+// It powers the Storage Guard which keeps the small Docker instance disk from
+// overflowing by relaying torrent data to the S3-compatible bucket (Cellar).
+type StorageConfig struct {
+	gorm.Model
+	// Master switch for relaying completed torrent files into S3.
+	S3Enabled bool `json:"s3_enabled" gorm:"default:true"`
+	// Begin uploading every torrent file to S3 immediately as it completes.
+	OffloadOnCompletion bool `json:"offload_on_completion" gorm:"default:true"`
+	// Delete local copies right after every file is confirmed in S3
+	// (keeps local disk usage near zero; streaming reads fall back to S3).
+	EvictAfterUpload bool `json:"evict_after_upload" gorm:"default:true"`
+	// Percentage of disk usage that triggers eviction of already-uploaded content.
+	HighWatermarkPercent int `json:"high_watermark_percent" gorm:"default:75"`
+	// Percentage of disk usage that pauses ALL active downloads (hard stop).
+	PauseWatermarkPercent int `json:"pause_watermark_percent" gorm:"default:88"`
+	// Torrents bigger than this many GB are downloaded in sequential batches
+	// that fit the local staging area ("Stream Mode"), never overflowing disk.
+	StreamThresholdGB int `json:"stream_threshold_gb" gorm:"default:12"`
+	// Maximum size of a single stream-mode batch (GB) resident on local disk.
+	BatchSizeGB int `json:"batch_size_gb" gorm:"default:8"`
+	// Number of parallel S3 upload workers.
+	MaxConcurrentUploads int `json:"max_concurrent_uploads" gorm:"default:2"`
+	// Key prefix inside the bucket (e.g. "clever-connect/").
+	S3Prefix string `json:"s3_prefix" gorm:"default:'clever-connect/'"`
+	// Stop seeding torrents that were offloaded to S3 (local data is gone).
+	StopSeedingOnOffload bool `json:"stop_seeding_on_offload" gorm:"default:true"`
+}
+
+// TorrentFileOffload is the per-file ledger of torrent data secured in S3.
+// It persists which torrent files were uploaded, under which S3 key, and
+// whether their local copy has been evicted. Essential for restart resilience.
+type TorrentFileOffload struct {
+	ID           uint       `gorm:"primaryKey" json:"id"`
+	InfoHash     string     `gorm:"type:varchar(40);index;not null" json:"info_hash"`
+	FileIndex    int        `gorm:"not null" json:"file_index"`
+	FilePath     string     `gorm:"type:text" json:"file_path"` // absolute local path
+	RelPath      string     `gorm:"type:text" json:"rel_path"`  // path inside the torrent
+	Size         int64      `json:"size"`
+	S3Key        string     `gorm:"type:varchar(512)" json:"s3_key"`
+	Uploaded     bool       `json:"uploaded" gorm:"default:false"`
+	UploadedAt   *time.Time `json:"uploaded_at"`
+	EvictedLocal bool       `json:"evicted_local" gorm:"default:false"`
+	EvictedAt    *time.Time `json:"evicted_at"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+}
+
+// StorageLog records important storage guard events for the admin panel.
+type StorageLog struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	Level     string    `json:"level" gorm:"size:20"` // info, warn, error
+	Source    string    `json:"source" gorm:"size:50"`
+	Message   string    `gorm:"type:text" json:"message"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -461,7 +534,7 @@ type V2RaySecurityEvent struct {
 	ID          uint      `gorm:"primaryKey" json:"id"`
 	Timestamp   time.Time `json:"timestamp" gorm:"index"`
 	IPAddress   string    `json:"ip_address" gorm:"size:100;index"`
-	EventType   string    `json:"event_type"` // failed_auth, port_scan
+	EventType   string    `json:"event_type"`   // failed_auth, port_scan
 	ActionTaken string    `json:"action_taken"` // banned, warned
 }
 
@@ -706,25 +779,25 @@ type DomainWhoisCache struct {
 // sub-system. This is a singleton row — only one config exists at a time.
 // It controls both Mode A (Selector/Failover) and Mode B (True Bonding/DMB).
 type BondingEngineConfig struct {
-	ID            uint      `gorm:"primaryKey" json:"id"`
-	IsActive      bool      `json:"is_active" gorm:"default:false"`
-	Mode          string    `json:"mode" gorm:"size:30;default:'selector'"` // "selector" | "bonding"
-	StripingMode  string    `json:"striping_mode" gorm:"size:30;default:'auto'"` // "auto" | "stripe" | "duplicate"
-	MaxArteries   int       `json:"max_arteries" gorm:"default:5"`
-	MinArteries   int       `json:"min_arteries" gorm:"default:2"`
-	CombinerURL   string    `json:"combiner_url" gorm:"type:text"` // wss://app.clever:8080/bond (bonding mode only)
-	OriginID      string    `json:"origin_id" gorm:"size:100"` // bonding group origin identity; arteries must match
-	PSKHex        string    `json:"psk_hex" gorm:"type:text"` // optional inner AEAD PSK; empty = rely on artery TLS
-	FrameSize     int       `json:"frame_size" gorm:"default:4096"` // on-wire frame size, 2-4KB recommended
-	SocksPort     int       `json:"socks_port" gorm:"default:10646"` // user-facing SOCKS5 proxy port
-	HTTPPort      int       `json:"http_port" gorm:"default:10545"` // user-facing HTTP proxy port
+	ID           uint   `gorm:"primaryKey" json:"id"`
+	IsActive     bool   `json:"is_active" gorm:"default:false"`
+	Mode         string `json:"mode" gorm:"size:30;default:'selector'"`      // "selector" | "bonding"
+	StripingMode string `json:"striping_mode" gorm:"size:30;default:'auto'"` // "auto" | "stripe" | "duplicate"
+	MaxArteries  int    `json:"max_arteries" gorm:"default:5"`
+	MinArteries  int    `json:"min_arteries" gorm:"default:2"`
+	CombinerURL  string `json:"combiner_url" gorm:"type:text"`   // wss://app.clever:8080/bond (bonding mode only)
+	OriginID     string `json:"origin_id" gorm:"size:100"`       // bonding group origin identity; arteries must match
+	PSKHex       string `json:"psk_hex" gorm:"type:text"`        // optional inner AEAD PSK; empty = rely on artery TLS
+	FrameSize    int    `json:"frame_size" gorm:"default:4096"`  // on-wire frame size, 2-4KB recommended
+	SocksPort    int    `json:"socks_port" gorm:"default:10646"` // user-facing SOCKS5 proxy port
+	HTTPPort     int    `json:"http_port" gorm:"default:10545"`  // user-facing HTTP proxy port
 	// Controller tuning thresholds (tunable without rebuild)
 	EvalWindowMs  int       `json:"eval_window_ms" gorm:"default:5000"` // evaluation window in ms
-	DemoteRTTx    float64   `json:"demote_rtt_x" gorm:"default:1.5"` // srtt > DemoteRTTx × median → demote
-	PromoteRTTx   float64   `json:"promote_rtt_x" gorm:"default:1.2"` // srtt within PromoteRTTx × best → promote
+	DemoteRTTx    float64   `json:"demote_rtt_x" gorm:"default:1.5"`    // srtt > DemoteRTTx × median → demote
+	PromoteRTTx   float64   `json:"promote_rtt_x" gorm:"default:1.2"`   // srtt within PromoteRTTx × best → promote
 	LossDemotePct float64   `json:"loss_demote_pct" gorm:"default:5.0"` // loss% threshold for demotion
-	CooldownSec   int       `json:"cooldown_sec" gorm:"default:30"` // cooldown before re-promotion
-	ErrorBudget   int       `json:"error_budget" gorm:"default:5"` // K failures in window → quarantine
+	CooldownSec   int       `json:"cooldown_sec" gorm:"default:30"`     // cooldown before re-promotion
+	ErrorBudget   int       `json:"error_budget" gorm:"default:5"`      // K failures in window → quarantine
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }
@@ -734,18 +807,18 @@ type BondingEngineConfig struct {
 // inbound port and tracks real-time performance metrics.
 type BondingArtery struct {
 	ID             uint      `gorm:"primaryKey" json:"id"`
-	NodeConfigID   uint      `json:"node_config_id"` // references V2RayClientConfig from PebbleDB
-	Tag            string    `json:"tag" gorm:"size:50"` // "artery-0", "artery-1", ...
-	LocalPort      int       `json:"local_port"` // 21001, 21002, ...
+	NodeConfigID   uint      `json:"node_config_id"`                        // references V2RayClientConfig from PebbleDB
+	Tag            string    `json:"tag" gorm:"size:50"`                    // "artery-0", "artery-1", ...
+	LocalPort      int       `json:"local_port"`                            // 21001, 21002, ...
 	State          string    `json:"state" gorm:"size:30;default:'active'"` // active|shadow|probation|dead|quarantined
-	WinRate        float64   `json:"win_rate" gorm:"default:0"` // percentage of packet races won
-	SrttMs         float64   `json:"srtt_ms" gorm:"default:0"` // smoothed round-trip time
-	LossPct        float64   `json:"loss_pct" gorm:"default:0"` // packet loss percentage
-	ThroughputMBps float64   `json:"throughput_mbps" gorm:"default:0"` // measured throughput
-	BytesUp        uint64    `json:"bytes_up" gorm:"default:0"` // cumulative upload bytes
-	BytesDown      uint64    `json:"bytes_down" gorm:"default:0"` // cumulative download bytes
-	ErrorCount     int       `json:"error_count" gorm:"default:0"` // consecutive error count
-	LastSwapAt     time.Time `json:"last_swap_at"` // last time this artery's node was swapped
+	WinRate        float64   `json:"win_rate" gorm:"default:0"`             // percentage of packet races won
+	SrttMs         float64   `json:"srtt_ms" gorm:"default:0"`              // smoothed round-trip time
+	LossPct        float64   `json:"loss_pct" gorm:"default:0"`             // packet loss percentage
+	ThroughputMBps float64   `json:"throughput_mbps" gorm:"default:0"`      // measured throughput
+	BytesUp        uint64    `json:"bytes_up" gorm:"default:0"`             // cumulative upload bytes
+	BytesDown      uint64    `json:"bytes_down" gorm:"default:0"`           // cumulative download bytes
+	ErrorCount     int       `json:"error_count" gorm:"default:0"`          // consecutive error count
+	LastSwapAt     time.Time `json:"last_swap_at"`                          // last time this artery's node was swapped
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }
@@ -758,13 +831,13 @@ type BondingArtery struct {
 // This is a singleton row — only one config exists at a time.
 type WarpGlobalConfig struct {
 	gorm.Model
-	ActiveAccountID uint   `json:"active_account_id"`                                       // FK to the currently executing WarpAccount
-	TransportMode   string `json:"transport_mode" gorm:"size:50;default:'masque'"`           // masque, masque_h2, wireguard
+	ActiveAccountID uint   `json:"active_account_id"`                              // FK to the currently executing WarpAccount
+	TransportMode   string `json:"transport_mode" gorm:"size:50;default:'masque'"` // masque, masque_h2, wireguard
 	TargetSNI       string `json:"target_sni" gorm:"size:255;default:'consumer-masque.cloudflareclient.com'"`
-	SocksPort       int    `json:"socks_port" gorm:"default:10880"`                          // Local SOCKS5 proxy port
-	HTTPPort        int    `json:"http_port" gorm:"default:10881"`                           // Local HTTP proxy port
-	IsActive        bool   `json:"is_active" gorm:"default:false"`                           // Whether the engine is running
-	LastTraceOK     bool   `json:"last_trace_ok" gorm:"default:false"`                       // Last captive portal trace status
+	SocksPort       int    `json:"socks_port" gorm:"default:10880"`    // Local SOCKS5 proxy port
+	HTTPPort        int    `json:"http_port" gorm:"default:10881"`     // Local HTTP proxy port
+	IsActive        bool   `json:"is_active" gorm:"default:false"`     // Whether the engine is running
+	LastTraceOK     bool   `json:"last_trace_ok" gorm:"default:false"` // Last captive portal trace status
 }
 
 // WarpAccount stores a Cloudflare WARP account profile in the fleet pool.
@@ -772,21 +845,20 @@ type WarpGlobalConfig struct {
 // (referenced by WarpGlobalConfig.ActiveAccountID).
 type WarpAccount struct {
 	gorm.Model
-	LicenseKey    string `json:"license_key" gorm:"size:30"`                // 26-char WARP+ license token
-	DeviceID      string `json:"device_id" gorm:"size:191;uniqueIndex"`     // Unique device identity from CF registration
-	Token         string `json:"token" gorm:"type:text"`                    // JWT Bearer token from CF edge
-	PrivateKey    string `json:"private_key" gorm:"type:text"`              // Base64 Curve25519 private key (ours)
-	PublicKey     string `json:"public_key" gorm:"size:255"`                // Base64 Curve25519 public key (ours)
-	PeerPublicKey string `json:"peer_public_key" gorm:"size:255"`           // Cloudflare's WireGuard server public key
-	ClientID      string `json:"client_id" gorm:"size:30"`                  // Base64 3-byte billing prefix (reserved bytes)
-	AssignedIPv4  string `json:"assigned_ipv4" gorm:"size:20"`              // WARP virtual IPv4 (e.g. 172.16.0.2)
-	AssignedIPv6  string `json:"assigned_ipv6" gorm:"size:50"`              // WARP virtual IPv6
-	AccountType   string `json:"account_type" gorm:"size:20;default:'free'"` // free, premium, warp_plus
-	TotalQuota       int64  `json:"total_quota" gorm:"default:0"`              // Total data allocation in bytes
-	UsedQuota        int64  `json:"used_quota" gorm:"default:0"`               // Consumed data allocation in bytes
-	IsFunctional     bool   `json:"is_functional" gorm:"default:true"`         // Invalidated on registration failure
+	LicenseKey       string `json:"license_key" gorm:"size:30"`                 // 26-char WARP+ license token
+	DeviceID         string `json:"device_id" gorm:"size:191;uniqueIndex"`      // Unique device identity from CF registration
+	Token            string `json:"token" gorm:"type:text"`                     // JWT Bearer token from CF edge
+	PrivateKey       string `json:"private_key" gorm:"type:text"`               // Base64 Curve25519 private key (ours)
+	PublicKey        string `json:"public_key" gorm:"size:255"`                 // Base64 Curve25519 public key (ours)
+	PeerPublicKey    string `json:"peer_public_key" gorm:"size:255"`            // Cloudflare's WireGuard server public key
+	ClientID         string `json:"client_id" gorm:"size:30"`                   // Base64 3-byte billing prefix (reserved bytes)
+	AssignedIPv4     string `json:"assigned_ipv4" gorm:"size:20"`               // WARP virtual IPv4 (e.g. 172.16.0.2)
+	AssignedIPv6     string `json:"assigned_ipv6" gorm:"size:50"`               // WARP virtual IPv6
+	AccountType      string `json:"account_type" gorm:"size:20;default:'free'"` // free, premium, warp_plus
+	TotalQuota       int64  `json:"total_quota" gorm:"default:0"`               // Total data allocation in bytes
+	UsedQuota        int64  `json:"used_quota" gorm:"default:0"`                // Consumed data allocation in bytes
+	IsFunctional     bool   `json:"is_functional" gorm:"default:true"`          // Invalidated on registration failure
 	MasquePrivateKey string `json:"masque_private_key"`
 	MasquePublicKey  string `json:"masque_public_key"`
 	MasqueActive     bool   `json:"masque_active"`
 }
-
