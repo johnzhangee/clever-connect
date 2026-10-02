@@ -384,8 +384,8 @@ func (m *TorrentManager) updateStats(persistDB bool) {
 			speedInfo.lastTime = now
 		}
 
-		// Only persist to DB every 5 ticks to stay well under the managed
-		// PostgreSQL plan's connection budget. In-memory state is always current.
+		// Only persist to DB every 5 ticks to stay under the Clever Cloud
+		// 5-connection MySQL limit. In-memory state is always current.
 		if !persistDB {
 			continue
 		}

@@ -687,7 +687,7 @@ type V2RayClientSetting struct {
 	Value string `json:"value"`
 }
 
-// IntArray represents an array of integers that GORM can persist as JSON text in SQLite/PostgreSQL
+// IntArray represents an array of integers that GORM can persist as JSON text in SQLite/MySQL
 type IntArray []int
 
 func (a IntArray) Value() (driver.Value, error) {
@@ -714,7 +714,7 @@ func (a *IntArray) Scan(src interface{}) error {
 	return json.Unmarshal(bytes, a)
 }
 
-// StringArray represents an array of strings that GORM can persist as JSON text in SQLite/PostgreSQL
+// StringArray represents an array of strings that GORM can persist as JSON text in SQLite/MySQL
 type StringArray []string
 
 func (a StringArray) Value() (driver.Value, error) {
