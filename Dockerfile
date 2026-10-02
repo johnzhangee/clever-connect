@@ -35,11 +35,11 @@ RUN mkdir -p web/client/dist && touch web/client/dist/index.html
 # Copy the rest of the Go codebase
 COPY . .
 
-# Compile Go backend binary with embedded SPA assets (optimizing RAM usage with concurrency limit)
-RUN CGO_ENABLED=0 GOGC=50 go build -p 1 -ldflags "-s -w" -o bin/clever-connect main.go
+# Compile Go backend binary with embedded SPA assets (parallel build across all CPU cores)
+RUN CGO_ENABLED=0 GOGC=50 go build -ldflags "-s -w" -o bin/clever-connect main.go
 
-# Compile Ehco binary from its nested module directory
-RUN cd internal/ehco-patched && CGO_ENABLED=0 GOGC=50 go build -p 1 -ldflags "-s -w" -o /app/bin/ehco ./cmd/ehco
+# Compile Ehco binary from its nested module directory (parallel build across all CPU cores)
+RUN cd internal/ehco-patched && CGO_ENABLED=0 GOGC=50 go build -ldflags "-s -w" -o /app/bin/ehco ./cmd/ehco
 
 # ==========================================
 # STAGE 3: MINIMAL RUNTIME CONTAINER
