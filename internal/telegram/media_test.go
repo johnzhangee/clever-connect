@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -9,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gotd/td/bin"
+	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tgerr"
 )
 
@@ -271,3 +274,79 @@ func TestPreparePlayableMediaFallsBackOnGarbageMP4(t *testing.T) {
 		t.Fatal("invalid MP4 must fall back to the original file")
 	}
 }
+
+func TestIsPoolFailure(t *testing.T) {
+	// The exact error shapes gotd produces when a connection pool is dead or
+	// stale (e.g. its owning client was closed after an engine restart).
+	poolFailures := []string{
+		// Observed in production logs: stale cached upload pool.
+		"parallel upload failed: upload part: send upload part 0 RPC: acquire connection: DC closed: context canceled",
+		"acquire connection: DC closed: context deadline exceeded",
+		"upload part: send upload part 3 RPC: invoke pool: engine forcibly closed",
+		"invoke pool: write: connection reset by peer",
+		"DC is closed",
+		"create DC 2 pool: client already closed",
+		"engine forcibly closed: context canceled",
+	}
+	for _, msg := range poolFailures {
+		if !isPoolFailure(fmt.Errorf("%s", msg)) {
+			t.Errorf("isPoolFailure(%q) = false, want true", msg)
+		}
+	}
+
+	// Ordinary errors (including a plain cancelled *request* context) must NOT
+	// be mistaken for pool failures — retrying those wastes a full re-upload.
+	nonPoolFailures := []string{
+		"parallel upload failed: context canceled",
+		"file upload failed: FLOOD_WAIT_420",
+		"open /tmp/file.bin: no such file or directory",
+		"upload part: send upload part 0 RPC: FILE_PARTS_INVALID",
+	}
+	for _, msg := range nonPoolFailures {
+		if isPoolFailure(fmt.Errorf("%s", msg)) {
+			t.Errorf("isPoolFailure(%q) = true, want false", msg)
+		}
+	}
+
+	if isPoolFailure(nil) {
+		t.Error("isPoolFailure(nil) = true, want false")
+	}
+}
+
+func TestPoolCachesAreKeyedByClient(t *testing.T) {
+	// telegram.NewClient does not dial anything, so distinct instances are
+	// safe to use as cache keys in tests.
+	c1 := telegram.NewClient(2040, "b18441a1ff607e10a989891a5624e0d4", telegram.Options{})
+	c2 := telegram.NewClient(2040, "b18441a1ff607e10a989891a5624e0d4", telegram.Options{})
+
+	// Upload pools: a pool stored for one client must not be served to
+	// another, and eviction must be isolated per client.
+	uploadPools.Store(c1, fakeInvoker{})
+	if _, ok := uploadPools.Load(c2); ok {
+		t.Fatal("upload pool cached for client #1 leaked into client #2")
+	}
+	resetUploadPool(c1)
+	if _, ok := uploadPools.Load(c1); ok {
+		t.Fatal("resetUploadPool did not evict client #1's pool")
+	}
+
+	// Download pools: same, per (client, DC) pair.
+	dcDownloadPools.Store(dcPoolKey{client: c1, dc: 4}, fakeInvoker{})
+	if _, ok := dcDownloadPools.Load(dcPoolKey{client: c2, dc: 4}); ok {
+		t.Fatal("DC pool cached for client #1 leaked into client #2")
+	}
+	// Same client, different DC must be a distinct entry.
+	if _, ok := dcDownloadPools.Load(dcPoolKey{client: c1, dc: 5}); ok {
+		t.Fatal("DC 4 pool leaked into DC 5 entry")
+	}
+	evictDCPool(c1, 4)
+	if _, ok := dcDownloadPools.Load(dcPoolKey{client: c1, dc: 4}); ok {
+		t.Fatal("evictDCPool did not evict the (client #1, DC 4) pool")
+	}
+}
+
+// fakeInvoker is a no-op stand-in for a pool entry in cache tests.
+type fakeInvoker struct{}
+
+func (fakeInvoker) Invoke(_ context.Context, _ bin.Encoder, _ bin.Decoder) error { return nil }
+func (fakeInvoker) Close() error                                                 { return nil }

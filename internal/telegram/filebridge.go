@@ -430,46 +430,77 @@ func calculateUploadThreads(fileSize int64) int {
 	}
 }
 
-// uploadPoolMu guards uploadPool below.
+// uploadPools caches one multi-connection upload invoker per MTProto client.
+// Uploads always target the session's home DC, so a single pool per client is
+// enough; it is reused across upload jobs instead of paying the pool setup
+// cost (N TCP + MTProto handshakes) on every upload.
+//
+// The pool is bound to the client's lifetime context, so it shuts down with
+// the engine. Keying by the client *instance* is critical: the engine can be
+// restarted dynamically (StopEngine → StartEngine creates a brand-new
+// *telegram.Client), and the old client's pools die with it. Serving a dead
+// pool to the new engine makes every upload fail instantly with
+// "acquire connection: DC closed: context canceled" — a new client must get a
+// fresh pool.
+var uploadPools sync.Map // map[*telegram.Client]telegram.CloseInvoker
+
+// uploadPoolMu serializes upload pool creation.
 var uploadPoolMu sync.Mutex
 
-// uploadPool caches the multi-connection invoker used by FastUploadFile.
-// Uploads always target the session's home DC, so one shared pool is reused
-// across upload jobs instead of paying the pool setup cost (N TCP + MTProto
-// handshakes) on every upload. Connections are opened lazily and the pool is
-// bound to the client's lifetime context, so it shuts down with the engine.
-var uploadPool telegram.CloseInvoker
-
-// getUploadPoolInvoker returns the cached home-DC upload pool, creating it on
-// first use.
-func getUploadPoolInvoker(ctx context.Context, client *telegram.Client) (telegram.CloseInvoker, error) {
+// getUploadPoolInvoker returns the client's cached home-DC upload pool,
+// creating it on first use.
+func getUploadPoolInvoker(client *telegram.Client) (telegram.CloseInvoker, error) {
 	uploadPoolMu.Lock()
 	defer uploadPoolMu.Unlock()
 
-	if uploadPool != nil {
-		return uploadPool, nil
+	if v, ok := uploadPools.Load(client); ok {
+		return v.(telegram.CloseInvoker), nil
 	}
 	invoker, err := client.Pool(downloadPoolMaxConns)
 	if err != nil {
 		return nil, err
 	}
-	uploadPool = invoker
+	uploadPools.Store(client, invoker)
 	return invoker, nil
 }
 
-// resetUploadPool drops the cached upload pool after a connection died
-// mid-transfer, so the next upload gets fresh connections. The old pool is
-// intentionally not closed (pool.Close would cancel any concurrent upload's
-// in-flight requests); it dies with the engine's context instead.
-func resetUploadPool() {
-	uploadPoolMu.Lock()
-	uploadPool = nil
-	uploadPoolMu.Unlock()
+// resetUploadPool drops the client's cached upload pool after it went bad, so
+// the next upload gets fresh connections. The old pool is intentionally not
+// closed (pool.Close would cancel any concurrent upload's in-flight
+// requests); it dies with the engine's context instead.
+func resetUploadPool(client *telegram.Client) {
+	uploadPools.Delete(client)
+}
+
+// isPoolFailure reports whether err indicates a dead or stale connection
+// pool (as opposed to an ordinary upload error). gotd surfaces these
+// differently depending on where the pool broke:
+//   - "invoke pool: …"                — the request died inside the pool
+//   - "acquire connection: DC closed" — the pool's context is dead (e.g. its
+//     client was closed after an engine restart)
+//   - "DC is closed"                  — pool.Close was already called
+//   - "client already closed"         — pool creation on a dead client
+//   - "engine forcibly closed"        — the owning client itself is dead
+func isPoolFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "invoke pool") ||
+		strings.Contains(msg, "DC closed") ||
+		strings.Contains(msg, "DC is closed") ||
+		strings.Contains(msg, "client already closed") ||
+		strings.Contains(msg, "engine forcibly closed")
 }
 
 // FastUploadFile uploads a file using concurrent goroutines via the gotd MTProto uploader.
 // It automatically calculates optimal threads based on file size.
 // The progress parameter is optional — pass nil to skip progress tracking.
+//
+// Robustness ladder: the client's cached multi-connection pool → a fresh pool
+// (if the cached one died or went stale) → the primary connection (slower, but
+// always works). Large files must never fail permanently just because a
+// connection pool misbehaved.
 func FastUploadFile(ctx context.Context, client *telegram.Client, filePath string, progress uploader.Progress) (tg.InputFileClass, error) {
 	info, err := os.Stat(filePath)
 	if err != nil {
@@ -484,17 +515,7 @@ func FastUploadFile(ctx context.Context, client *telegram.Client, filePath strin
 		"threads", threads,
 	)
 
-	upload := func() (tg.InputFileClass, error) {
-		var invoker tg.Invoker = client
-		if threads > 1 {
-			poolInvoker, err := getUploadPoolInvoker(ctx, client)
-			if err != nil {
-				logger.Warn("Telegram", "Failed to create connection pool for upload, using single connection", "error", err)
-			} else {
-				invoker = poolInvoker
-			}
-		}
-
+	runUpload := func(invoker tg.Invoker) (tg.InputFileClass, error) {
 		up := uploader.NewUploader(tg.NewClient(invoker)).
 			WithThreads(threads).
 			WithPartSize(512 * 1024) // 512KB chunks — maximum for speed
@@ -506,14 +527,34 @@ func FastUploadFile(ctx context.Context, client *telegram.Client, filePath strin
 		return up.FromPath(ctx, filePath)
 	}
 
-	inputFile, err := upload()
-	if err != nil && strings.Contains(err.Error(), "invoke pool") {
-		// A pooled connection died mid-upload. Drop the cached pool so this
-		// job (and every future one) gets fresh connections, then retry once.
-		logger.Warn("Telegram", "Upload pool connection died mid-transfer, retrying with fresh connections", "error", err)
-		resetUploadPool()
-		inputFile, err = upload()
+	// Attempt 1: the client's cached multi-connection pool.
+	inputFile, err := func() (tg.InputFileClass, error) {
+		poolInvoker, perr := getUploadPoolInvoker(client)
+		if perr != nil {
+			logger.Warn("Telegram", "Failed to create upload connection pool, using primary connection", "error", perr)
+			return runUpload(client)
+		}
+		return runUpload(poolInvoker)
+	}()
+
+	// Attempt 2: the cached pool died mid-transfer or went stale (e.g. after
+	// an engine restart) — drop it and retry with brand-new connections.
+	if err != nil && isPoolFailure(err) {
+		logger.Warn("Telegram", "Upload pool failed, retrying with a fresh pool", "error", err)
+		resetUploadPool(client)
+		if poolInvoker, perr := getUploadPoolInvoker(client); perr == nil {
+			inputFile, err = runUpload(poolInvoker)
+		}
 	}
+
+	// Attempt 3 (last resort): upload over the primary connection. Slower,
+	// but guarantees large files still get through when pools misbehave.
+	if err != nil && isPoolFailure(err) {
+		logger.Warn("Telegram", "Upload pool failed again, falling back to the primary connection", "error", err)
+		resetUploadPool(client)
+		inputFile, err = runUpload(client)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("parallel upload failed: %w", err)
 	}
@@ -532,12 +573,24 @@ func FastUploadFile(ctx context.Context, client *telegram.Client, filePath strin
 // out around 1-5 MB/s, 16 connections reach 30-80+ MB/s from a fast host).
 const downloadPoolMaxConns = 16
 
-// dcDownloadPools caches multi-connection invokers per datacenter (dc id →
-// telegram.CloseInvoker). Pools are expensive to create (TCP + MTProto
-// handshake + auth transfer), so they are created once and reused across every
-// subsequent download job from the same DC. The pools are bound to the client's
-// lifetime context, so they shut down automatically with the engine.
-var dcDownloadPools sync.Map
+// dcPoolKey identifies a download pool: the owning MTProto client plus the
+// target datacenter. Keying by the client *instance* is critical — the engine
+// can be restarted dynamically (StopEngine → StartEngine creates a brand-new
+// *telegram.Client), and the old client's pools die with it. Serving a dead
+// pool to the new engine makes every download fail instantly with
+// "acquire connection: DC closed: context canceled" — a new client must get
+// fresh pools.
+type dcPoolKey struct {
+	client *telegram.Client
+	dc     int
+}
+
+// dcDownloadPools caches multi-connection invokers per (client, datacenter).
+// Pools are expensive to create (TCP + MTProto handshake + auth transfer), so
+// they are created once and reused across every subsequent download job from
+// the same DC. The pools are bound to the client's lifetime context, so they
+// shut down automatically with the engine.
+var dcDownloadPools sync.Map // map[dcPoolKey]telegram.CloseInvoker
 
 // dcPoolMu serializes pool creation so concurrent jobs never race on
 // client.DC's authorization transfer.
@@ -552,7 +605,8 @@ func getDCPoolInvoker(ctx context.Context, client *telegram.Client, dcID int) (t
 	dcPoolMu.Lock()
 	defer dcPoolMu.Unlock()
 
-	if v, ok := dcDownloadPools.Load(dcID); ok {
+	key := dcPoolKey{client: client, dc: dcID}
+	if v, ok := dcDownloadPools.Load(key); ok {
 		return v.(telegram.CloseInvoker), nil
 	}
 
@@ -561,18 +615,19 @@ func getDCPoolInvoker(ctx context.Context, client *telegram.Client, dcID int) (t
 		return nil, fmt.Errorf("create DC %d pool: %w", dcID, err)
 	}
 
-	dcDownloadPools.Store(dcID, invoker)
+	dcDownloadPools.Store(key, invoker)
 	return invoker, nil
 }
 
 // evictDCPool drops a cached DC pool whose connections have gone bad
-// ("invoke pool: engine forcibly closed" mid-request) so the next download
-// creates a fresh pool with new connections. The old pool is intentionally
-// NOT closed: a concurrent download may still be using it, and pool.DC.Close()
-// would cancel its in-flight requests. The abandoned pool is bound to the
-// client's lifetime context, so the engine shuts it down automatically.
-func evictDCPool(dcID int) {
-	dcDownloadPools.Delete(dcID)
+// ("invoke pool: engine forcibly closed" mid-request, or a stale pool from a
+// restarted engine) so the next download creates a fresh pool with new
+// connections. The old pool is intentionally NOT closed: a concurrent download
+// may still be using it, and pool.DC.Close() would cancel its in-flight
+// requests. The abandoned pool is bound to the client's lifetime context, so
+// the engine shuts it down automatically.
+func evictDCPool(client *telegram.Client, dcID int) {
+	dcDownloadPools.Delete(dcPoolKey{client: client, dc: dcID})
 }
 
 // extractMigrateDC inspects a download error for a Telegram FILE_MIGRATE /
@@ -687,13 +742,14 @@ func FastDownloadFile(ctx context.Context, client *telegram.Client, dcID int, fi
 			return fmt.Errorf("download cancelled: %w", ctx.Err())
 		}
 
-		// A pooled connection that died mid-request surfaces as
-		// "invoke pool: engine forcibly closed". Evict the poisoned pool so
-		// this attempt and future jobs get fresh connections.
-		if pooled && strings.Contains(lastErr.Error(), "invoke pool") {
+		// A pooled connection that died mid-request (or a stale pool left over
+		// from a previous engine run) surfaces as an "invoke pool" / "DC
+		// closed" error. Evict the poisoned pool so this attempt and future
+		// jobs get fresh connections.
+		if pooled && isPoolFailure(lastErr) {
 			logger.Warn("Telegram", "Download pool connection died mid-transfer, evicting cached pool",
 				"dc", dcID, "error", lastErr)
-			evictDCPool(dcID)
+			evictDCPool(client, dcID)
 			api = tg.NewClient(client)
 			pooled = false
 		}
