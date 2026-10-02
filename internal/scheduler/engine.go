@@ -1068,6 +1068,18 @@ func (s *Scheduler) registerBuiltinJobs() {
 		return nil
 	})
 
+	// Re-materialize a local source for one cloud upload row: the on-disk
+	// file when it still exists, otherwise a transient copy recovered from
+	// the S3 archive or the cloud-storage index (deleted by the returned
+	// cleanup right after the transfer finished). The stat-first fast path
+	// keeps existing local files uploading straight from disk.
+	sourceForCloudUpload := func(localPath string) (string, func(), error) {
+		if _, err := os.Stat(localPath); err == nil {
+			return localPath, nil, nil
+		}
+		return filecore.MaterializeForUpload(localPath)
+	}
+
 	// Universal cloud storage upload (rclone). Each pre-created RcloneUpload row
 	// is one file's copy-only transfer to an admin-configured provider remote.
 	// Machine-wide saturation is double-gated: this job fans out one worker per
@@ -1166,14 +1178,30 @@ func (s *Scheduler) registerBuiltinJobs() {
 					}
 
 					rclone.MarkUploading(row.ID)
-					_, err := rclone.UploadFile(ctx, &remote, row.LocalPath, strings.TrimPrefix(row.RemotePath, remote.Name+":"), rclone.UploadArgs{Args: validatedFlags})
-					if err != nil {
-						logFn("ERROR", fmt.Sprintf("Failed to upload %s to %s: %v", filepath.Base(row.LocalPath), remote.Name, err))
-						rclone.MarkFailed(row.ID, err.Error())
+
+					// The local source may have been evicted from the ephemeral
+					// disk after it was archived to S3 or mirrored to a cloud
+					// remote. Materialize a transient copy (local disk → S3
+					// archive → cloud-storage index) and delete it the moment
+					// this transfer finishes.
+					srcPath, cleanup, srcErr := sourceForCloudUpload(row.LocalPath)
+					if srcErr != nil {
+						logFn("ERROR", fmt.Sprintf("Failed to source %s for cloud upload: %v", filepath.Base(row.LocalPath), srcErr))
+						rclone.MarkFailed(row.ID, fmt.Sprintf("source not available: %v", srcErr))
 						atomic.AddInt64(&failed, 1)
 					} else {
-						rclone.FinalizeUpload(ctx, &remote, &row)
-						logFn("INFO", fmt.Sprintf("Uploaded %s to %s", filepath.Base(row.LocalPath), row.RemotePath))
+						_, err := rclone.UploadFile(ctx, &remote, srcPath, strings.TrimPrefix(row.RemotePath, remote.Name+":"), rclone.UploadArgs{Args: validatedFlags})
+						if cleanup != nil {
+							cleanup()
+						}
+						if err != nil {
+							logFn("ERROR", fmt.Sprintf("Failed to upload %s to %s: %v", filepath.Base(row.LocalPath), remote.Name, err))
+							rclone.MarkFailed(row.ID, err.Error())
+							atomic.AddInt64(&failed, 1)
+						} else {
+							rclone.FinalizeUpload(ctx, &remote, &row)
+							logFn("INFO", fmt.Sprintf("Uploaded %s to %s", filepath.Base(row.LocalPath), row.RemotePath))
+						}
 					}
 
 					finished := atomic.AddInt64(&done, 1)

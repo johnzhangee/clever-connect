@@ -171,6 +171,13 @@ func MaterializeForUpload(absPath string) (localPath string, cleanup func(), err
 //  4.  Last resort: basename looks like a hex-encoded key → fetch directly
 //     from S3 without a registry record (orphaned reference), verified.
 //
+//  4b. Cloud-storage index (rclone remotes): the file exists on a configured
+//     provider remote (S3, Google Drive, SFTP, ...) while the local copy was
+//     evicted. Candidates are resolved by exact manager-relative path, then
+//     by basename, and `rclone cat` streams the first that yields content
+//     into a temp file the caller must delete via cleanup() right after the
+//     upload finished.
+//
 //  5.  File present on disk (non-sparse) → return local copy.
 //  6.  Nothing found → actionable error.
 //
@@ -286,6 +293,16 @@ func MaterializeForUploadWithTorrent(absPath, torrentHash string) (localPath str
 		}
 	}
 
+	// 4b. Cloud-storage index (universal rclone remotes): the file is on a
+	//     configured provider remote (S3, Google Drive, SFTP, ...) while the
+	//     local copy was evicted. `rclone cat` streams it into a temp file;
+	//     the caller's cleanup() deletes it as soon as the upload finished.
+	if p, c, ok, e := tryRcloneIndex(absPath); e != nil {
+		return "", nil, e
+	} else if ok {
+		return p, c, nil
+	}
+
 	// 5. A torrent sparse stub on disk with no recoverable S3 key anywhere —
 	//    the S3 archive likely failed (or the object was deleted). Best effort:
 	//    return the local stub so the caller can decide (prior on-disk behaviour).
@@ -293,8 +310,10 @@ func MaterializeForUploadWithTorrent(absPath, torrentHash string) (localPath str
 		return absPath, func() {}, nil
 	}
 
-	// 6. Genuinely unrecoverable: not on disk and not physically in any S3 key.
-	return "", nil, fmt.Errorf("file not found locally and not archived in S3: %s", absPath)
+	// 6. Genuinely unrecoverable: not on disk, not physically in any S3 key
+	//    and not present on any indexed cloud-storage remote either.
+	return "", nil, fmt.Errorf(
+		"file not found locally and not archived in S3 or any cloud remote: %s", absPath)
 }
 
 // lookupAlternateS3Key resolves an S3 object key for a path whose exact
