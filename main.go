@@ -284,6 +284,7 @@ func main() {
 	novaHandler := handlers.NewNovaForwarderHandler(cfg)
 	warpHandler := handlers.NewWarpHandler(cfg)
 	trusttunnelHandler := handlers.NewTrustTunnelHandler(cfg)
+	rcloneHandler := handlers.NewRcloneHandler(cfg)
 
 	// Auto-start combiner if configured (after handler creation)
 	if cfg.AppMode == "server" {
@@ -521,6 +522,22 @@ func main() {
 			protected.GET("/storage/logs", storageHandler.GetLogs)
 			protected.POST("/storage/restore/:hash", storageHandler.RestoreTorrent)
 			protected.POST("/storage/reoffload/:hash", storageHandler.ReoffloadTorrent)
+
+			// Universal Cloud Storage (rclone multi-provider) API Endpoints
+			protected.GET("/rclone/status", rcloneHandler.GetStatus)
+			protected.POST("/rclone/system", rcloneHandler.UpdateSystem)
+			protected.POST("/rclone/install", rcloneHandler.InstallBinary)
+			protected.GET("/rclone/providers", rcloneHandler.GetProviders)
+			protected.GET("/rclone/remotes", rcloneHandler.ListRemotes)
+			protected.POST("/rclone/remotes", rcloneHandler.CreateRemote)
+			protected.PUT("/rclone/remotes/:id", rcloneHandler.UpdateRemote)
+			protected.DELETE("/rclone/remotes/:id", rcloneHandler.DeleteRemote)
+			protected.POST("/rclone/remotes/:id/test", rcloneHandler.TestRemote)
+			protected.POST("/rclone/remotes/:id/list", rcloneHandler.ListRemoteDir)
+			protected.POST("/rclone/upload", rcloneHandler.StartUpload)
+			protected.GET("/rclone/uploads", rcloneHandler.ListUploads)
+			protected.POST("/rclone/uploads/:id/link", rcloneHandler.RefreshUploadLink)
+			protected.DELETE("/rclone/uploads/:id", rcloneHandler.DeleteUpload)
 
 			// YouTube Downloader API Endpoints
 			protected.POST("/youtube/info", youtubeHandler.FetchInfo)
