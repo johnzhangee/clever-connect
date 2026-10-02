@@ -10,6 +10,8 @@
 package storageguard
 
 import (
+	"fmt"
+	"runtime"
 	"sync"
 	"time"
 
@@ -66,7 +68,10 @@ var Default = &Guard{
 	lastUploaded: make(map[string]uploadedSnapshot),
 }
 
-// Init seeds the default StorageConfig row (called after DB migrations).
+// Init seeds the default StorageConfig row (called after DB migrations). It
+// also re-floors legacy configurations — MaxConcurrentUploads was historically
+// seeded at 2, which starves multi-core hosts — to one offload upload per CPU
+// core so eviction sweeps use the full machine.
 func Init() {
 	var cfg models.StorageConfig
 	if err := db.DB.First(&cfg).Error; err != nil {
@@ -74,9 +79,30 @@ func Init() {
 		if err := db.DB.Create(&cfg).Error; err != nil {
 			logger.Error("StorageGuard", "Failed to seed StorageConfig", "error", err)
 		} else {
-			logEvent("info", "init", "Seeded default storage config (S3 offloading on)")
+			logEvent("info", "init", fmt.Sprintf(
+				"Seeded default storage config (S3 offloading on, %d concurrent uploads)", cfg.MaxConcurrentUploads))
 		}
+	} else if cfg.MaxConcurrentUploads < autoUploadWorkers() {
+		cfg.MaxConcurrentUploads = autoUploadWorkers()
+		db.DB.Model(&models.StorageConfig{}).Where("id = ?", cfg.ID).
+			Update("max_concurrent_uploads", cfg.MaxConcurrentUploads)
+		logEvent("info", "init", fmt.Sprintf(
+			"Auto-scaled max_concurrent_uploads to %d (one S3 upload per CPU core)", cfg.MaxConcurrentUploads))
 	}
+}
+
+// autoUploadWorkers is the automatic offload upload concurrency: one transfer
+// per CPU core, capped at 16 to mirror the manual ceiling enforced by the
+// storage admin API.
+func autoUploadWorkers() int {
+	n := runtime.NumCPU()
+	if n < 1 {
+		n = 1
+	}
+	if n > 16 {
+		n = 16
+	}
+	return n
 }
 
 func defaultStorageConfig() models.StorageConfig {
@@ -88,7 +114,7 @@ func defaultStorageConfig() models.StorageConfig {
 		PauseWatermarkPercent: 88,
 		StreamThresholdGB:     12,
 		BatchSizeGB:           8,
-		MaxConcurrentUploads:  2,
+		MaxConcurrentUploads:  autoUploadWorkers(),
 		S3Prefix:              "clever-connect/",
 		StopSeedingOnOffload:  true,
 	}

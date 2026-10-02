@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"clever-connect/internal/db"
@@ -35,6 +36,23 @@ var (
 	initOnce sync.Once
 )
 
+// autoWorkerCount is the automatic worker-pool size for fresh installs and the
+// boot-time floor for the persisted value: one scheduler worker per CPU core.
+// Transfer jobs (S3 multipart, Telegram MTProto) are I/O-heavy, so a core-count
+// of parallel jobs saturates the uplink while giving every core its own job.
+// It is capped at 32 to mirror the manual configuration ceiling enforced by the
+// scheduler config API (handlers.SaveConfig).
+func autoWorkerCount() int {
+	n := runtime.NumCPU()
+	if n < 1 {
+		n = 1
+	}
+	if n > 32 {
+		n = 32
+	}
+	return n
+}
+
 // JobFunc is the actual work payload that a scheduled job executes.
 type JobFunc func(ctx context.Context, job *models.SchedulerJob, logFn func(level, message string)) error
 
@@ -58,17 +76,31 @@ func Init() {
 		var cfg models.SchedulerConfig
 		if err := db.DB.First(&cfg).Error; err != nil {
 			cfg = models.SchedulerConfig{
-				MaxConcurrentJobs:  4,
-				DefaultPriority:    5,
-				RetryLimit:         3,
-				RetryDelaySeconds:  30,
-				JobTimeoutSeconds:  3600,
-				PurgeAfterDays:     30,
-				EnableCronJobs:     true,
+				MaxConcurrentJobs:   autoWorkerCount(),
+				DefaultPriority:     5,
+				RetryLimit:          3,
+				RetryDelaySeconds:   30,
+				JobTimeoutSeconds:   3600,
+				PurgeAfterDays:      30,
+				EnableCronJobs:      true,
 				EnableNotifications: false,
 			}
 			db.DB.Create(&cfg)
-			logger.Info("Scheduler", "Seeded default scheduler configuration")
+			logger.Info("Scheduler", "Seeded default scheduler configuration",
+				"workers", cfg.MaxConcurrentJobs, "cpus", runtime.NumCPU())
+		} else if cfg.MaxConcurrentJobs < autoWorkerCount() {
+			// Historical installs were seeded with MaxConcurrentJobs = 4, which
+			// starves multi-core hosts: the whole job engine (S3 moves, Telegram
+			// uploads, tarballs, …) ran at most four jobs at a time. Re-floor the
+			// persisted value at one worker per CPU core so every core can execute
+			// a transfer job concurrently. Admins can still override the value at
+			// runtime via POST /api/scheduler/config (clamped 1..32); the boot-time
+			// floor applies again on the next restart.
+			cfg.MaxConcurrentJobs = autoWorkerCount()
+			db.DB.Model(&models.SchedulerConfig{}).Where("id = ?", cfg.ID).
+				Update("max_concurrent_jobs", cfg.MaxConcurrentJobs)
+			logger.Info("Scheduler", "Auto-scaled worker pool to CPU core count",
+				"workers", cfg.MaxConcurrentJobs, "cpus", runtime.NumCPU())
 		}
 
 		Engine = &Scheduler{
@@ -808,7 +840,7 @@ func (s *Scheduler) registerBuiltinJobs() {
 	// File compression job
 	s.RegisterJob("file_compress", func(ctx context.Context, job *models.SchedulerJob, logFn func(string, string)) error {
 		logFn("INFO", "File compression job started")
-		
+
 		var payload struct {
 			Files    []string `json:"files"`
 			DestName string   `json:"dest_name"`
@@ -839,7 +871,7 @@ func (s *Scheduler) registerBuiltinJobs() {
 	// File decompression job
 	s.RegisterJob("file_decompress", func(ctx context.Context, job *models.SchedulerJob, logFn func(string, string)) error {
 		logFn("INFO", fmt.Sprintf("Starting extraction of %s", job.Description))
-		
+
 		archivePath := job.Payload
 		var password string
 
@@ -954,25 +986,69 @@ func (s *Scheduler) registerBuiltinJobs() {
 			return fmt.Errorf("all %d requested path(s) are missing from disk and not found in S3 registry — files lost on ephemeral disk", len(payload.Paths))
 		}
 
-		logFn("INFO", fmt.Sprintf("Moving %d file(s) to S3 (upload + remove local)", total))
+		// Parallel, CPU-wide fan-out: every file is an independent transfer
+		// handled by a dedicated worker — one per CPU core (bounded by the file
+		// count) — so a multi-file archive saturates the machine instead of
+		// trickling through a single serial loop.
+		workers := runtime.NumCPU()
+		if workers > total {
+			workers = total
+		}
+		if workers < 1 {
+			workers = 1
+		}
+		logFn("INFO", fmt.Sprintf("Moving %d file(s) to S3 (upload + remove local, %d parallel workers)", total, workers))
 
-		var failed int
-		for i, fp := range filePaths {
-			select {
-			case <-ctx.Done():
-				return context.Canceled
-			default:
+		var (
+			failed int64 // atomic: transfers that failed
+			done   int64 // atomic: transfers finished (uploaded or failed)
+		)
+		work := make(chan string)
+		var wg sync.WaitGroup
+
+		// Feeder: streams every path into the work channel, aborting early
+		// when the job is cancelled.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer close(work)
+			for _, fp := range filePaths {
+				select {
+				case <-ctx.Done():
+					return
+				case work <- fp:
+				}
 			}
+		}()
 
-			if _, err := filecore.RegisterAndArchiveToS3(fp, "", "", 0, "", false); err != nil {
-				logFn("ERROR", fmt.Sprintf("Failed to archive %s: %v", fp, err))
-				failed++
-			} else {
-				logFn("INFO", fmt.Sprintf("Archived %s to S3", filepath.Base(fp)))
-			}
+		// Workers: each owns one file at a time — registry dedup, parallel
+		// multipart S3 upload and local-copy removal as a single unit.
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for fp := range work {
+					if ctx.Err() != nil {
+						continue // cancelled: drain the remaining queue fast
+					}
 
-			progress := ((i + 1) * 100) / total
-			db.DB.Model(job).Update("progress", progress)
+					if _, err := filecore.RegisterAndArchiveToS3(fp, "", "", 0, "", false); err != nil {
+						logFn("ERROR", fmt.Sprintf("Failed to archive %s: %v", fp, err))
+						atomic.AddInt64(&failed, 1)
+					} else {
+						logFn("INFO", fmt.Sprintf("Archived %s to S3", filepath.Base(fp)))
+					}
+
+					finished := atomic.AddInt64(&done, 1)
+					db.DB.Model(job).Update("progress", int(finished*100/int64(total)))
+				}
+			}()
+		}
+		wg.Wait()
+
+		if ctx.Err() != nil {
+			logFn("WARN", "Cancelled mid-archive — remaining files left for the retry cycle")
+			return context.Canceled
 		}
 
 		if failed > 0 {
@@ -1240,4 +1316,3 @@ func runGeoSweepJob(ctx context.Context, job *models.SchedulerJob, logFn func(st
 	logFn("INFO", fmt.Sprintf("Successfully finished Geo Sweep Job. Resolved %d IPs.", resolvedCount))
 	return nil
 }
-

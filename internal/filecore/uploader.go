@@ -53,19 +53,26 @@ import (
 // swap that middleware back to the real ComputePayloadSHA256 so the SDK
 // hashes the actual body bytes and sends the true digest.
 const (
-	defaultPartSize    = 16 * 1024 * 1024 // 16 MiB per part
-	minimumConcurrency = 8                // floor for single-core containers
-	uploadBufPartSize  = 16 * 1024 * 1024 // must match defaultPartSize
+	defaultPartSize      = 16 * 1024 * 1024 // 16 MiB per part
+	minimumConcurrency   = 8                // floor for single-core containers
+	maxUploadConcurrency = 16               // ceiling keeping multi-file parallel archives memory-safe
+	uploadBufPartSize    = 16 * 1024 * 1024 // must match defaultPartSize
 )
-
 
 // concurrencyForUpload scales the parallel part workers with available CPU,
 // floored at minimumConcurrency so even single-core containers saturate the link
-// (the bottleneck is always network, not CPU).
+// (the bottleneck is always network, not CPU). The ceiling matters now that
+// whole-file transfers execute one per CPU core (the scheduler file_to_s3
+// fan-out and the torrent inline archiver): worker memory stays bounded at
+// maxUploadConcurrency × 16 MiB = 256 MiB per in-flight file — about 3 GiB
+// across 12 parallel archives on a 12-core host.
 func concurrencyForUpload() int {
-	c := runtime.GOMAXPROCS(0) * 4
+	c := runtime.GOMAXPROCS(0)
 	if c < minimumConcurrency {
 		c = minimumConcurrency
+	}
+	if c > maxUploadConcurrency {
+		c = maxUploadConcurrency
 	}
 	return c
 }

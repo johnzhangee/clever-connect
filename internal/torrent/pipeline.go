@@ -49,7 +49,7 @@ import (
 // TorrentS3MovePayload is the canonical JSON payload for a torrent_s3_move job.
 type TorrentS3MovePayload struct {
 	InfoHash      string `json:"info_hash"`
-	FilePath      string `json:"file_path"`      // relative path inside SaveDirectory
+	FilePath      string `json:"file_path"` // relative path inside SaveDirectory
 	SaveDirectory string `json:"save_directory"`
 	ChatID        int64  `json:"chat_id"` // 0 → use default at runtime
 }
@@ -166,7 +166,7 @@ func findArchivedRegistry(torrentFilePath, infoHash string) (reg models.FileRegi
 //  5. On success → punchHole to free the ephemeral disk blocks (sparse stub
 //     preserves the logical size) and chain the Telegram upload.
 //
-// The goroutine is bounded by m.archiveSem (4 concurrent archives) to
+// The goroutine is bounded by m.archiveSem (one archive transfer per CPU core) to
 // protect container memory on large multi-file torrents. It never holds the
 // manager mutex.
 func (m *TorrentManager) archiveTorrentFileInline(infoHash, saveDir, filePath string, chatID int64) {
@@ -239,14 +239,14 @@ func (m *TorrentManager) archiveTorrentFileInline(infoHash, saveDir, filePath st
 // file was missing), or for jobs left queued across a container restart.
 //
 // Recovery-first logic:
-//  - If the file is on disk → upload to S3, punch the local blocks, chain
-//    Telegram (the normal fallback upload).
-//  - If the file is missing but already in the S3 registry (exact path /
-//    torrent hash / basename) → just chain Telegram.
-//  - If the file is missing and not in S3, but the torrent is still
-//    re-downloading after a restart → defer (success) so the inline archiver
-//    handles the re-download; do not burn the retry budget.
-//  - Otherwise (torrent paused/gone) → permanent failure.
+//   - If the file is on disk → upload to S3, punch the local blocks, chain
+//     Telegram (the normal fallback upload).
+//   - If the file is missing but already in the S3 registry (exact path /
+//     torrent hash / basename) → just chain Telegram.
+//   - If the file is missing and not in S3, but the torrent is still
+//     re-downloading after a restart → defer (success) so the inline archiver
+//     handles the re-download; do not burn the retry budget.
+//   - Otherwise (torrent paused/gone) → permanent failure.
 //
 // Pipeline (normal fallback upload, file present):
 //  1. Parse payload & validate file on disk.

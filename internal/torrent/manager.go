@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -58,7 +59,7 @@ type TorrentManager struct {
 	speeds          map[string]*torrentSpeed
 	registeredFiles map[string]bool // tracks per-file S3 registration (infoHash:filePath)
 	completing      map[string]bool // infoHash -> true while a torrent is being archived to S3
-	archiveSem      chan struct{}   // bounds concurrent S3 archive (move) operations to protect memory
+	archiveSem      chan struct{}   // bounds concurrent S3 archive (move) transfers: one per CPU core
 	stopStats       chan struct{}
 	uploadLimiter   *rate.Limiter
 	downloadLimiter *rate.Limiter
@@ -181,7 +182,7 @@ func Init() error {
 		speeds:          make(map[string]*torrentSpeed),
 		registeredFiles: make(map[string]bool),
 		completing:      make(map[string]bool),
-		archiveSem:      make(chan struct{}, 4),
+		archiveSem:      make(chan struct{}, runtime.NumCPU()),
 		stopStats:       make(chan struct{}),
 		uploadLimiter:   uploadLimiter,
 		downloadLimiter: downloadLimiter,
