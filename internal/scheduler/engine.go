@@ -20,6 +20,7 @@ import (
 	"clever-connect/internal/geo"
 	"clever-connect/internal/logger"
 	"clever-connect/internal/models"
+	"clever-connect/internal/rclone"
 	"clever-connect/internal/telegram"
 	"clever-connect/internal/torrent"
 
@@ -1064,6 +1065,134 @@ func (s *Scheduler) registerBuiltinJobs() {
 		}
 
 		logFn("INFO", fmt.Sprintf("Successfully moved all %d file(s) to S3", total))
+		return nil
+	})
+
+	// Universal cloud storage upload (rclone). Each pre-created RcloneUpload row
+	// is one file's copy-only transfer to an admin-configured provider remote.
+	// Machine-wide saturation is double-gated: this job fans out one worker per
+	// CPU core, and internal/rclone additionally bounds concurrent rclone
+	// subprocesses process-wide so overlapping jobs share cores fairly.
+	s.RegisterJob("rclone_upload", func(ctx context.Context, job *models.SchedulerJob, logFn func(string, string)) error {
+		var payload struct {
+			UploadIDs     []uint `json:"upload_ids"`
+			RemoteID      uint   `json:"remote_id"`
+			RemoteName    string `json:"remote_name"`
+			KeepStructure bool   `json:"keep_structure"`
+		}
+		if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
+			return fmt.Errorf("failed to parse cloud-upload payload: %w", err)
+		}
+
+		if _, err := rclone.EnsureBinary(ctx); err != nil {
+			return fmt.Errorf("cloud storage engine not ready: %w", err)
+		}
+
+		// Load the target remote (id preferred, name fallback).
+		var remote models.RcloneRemote
+		if payload.RemoteID > 0 {
+			if err := db.DB.First(&remote, payload.RemoteID).Error; err != nil {
+				return fmt.Errorf("remote %d not found: %w", payload.RemoteID, err)
+			}
+		} else if payload.RemoteName != "" {
+			if err := db.DB.Where("name = ?", payload.RemoteName).First(&remote).Error; err != nil {
+				return fmt.Errorf("remote %q not found: %w", payload.RemoteName, err)
+			}
+		} else {
+			return fmt.Errorf("no remote referenced by cloud-upload payload")
+		}
+		if !remote.Enabled {
+			return fmt.Errorf("remote %q is disabled", remote.Name)
+		}
+
+		// Load the pending upload rows for this job (queued ones; skips files
+		// already finished by a previous attempt).
+		var rows []models.RcloneUpload
+		if err := db.DB.Where("id IN ? AND status = ?", payload.UploadIDs, "queued").
+			Order("id ASC").Find(&rows).Error; err != nil {
+			return fmt.Errorf("failed to load upload records: %w", err)
+		}
+		if len(rows) == 0 {
+			logFn("INFO", "No queued uploads remain for this job — nothing to do")
+			db.DB.Model(job).Update("progress", 100)
+			return nil
+		}
+
+		// Re-validate admin-supplied extra flags on every run.
+		validatedFlags, flagsErr := rclone.ValidateExtraFlags(remote.ExtraFlags)
+		if flagsErr != nil {
+			return fmt.Errorf("remote %q has invalid extra flags: %w", remote.Name, flagsErr)
+		}
+
+		total := len(rows)
+		workers := runtime.NumCPU()
+		if workers > total {
+			workers = total
+		}
+		if workers < 1 {
+			workers = 1
+		}
+		logFn("INFO", fmt.Sprintf("Uploading %d file(s) to %s (rclone, %d parallel workers)", total, remote.Name, workers))
+
+		var (
+			failed int64
+			done   int64
+		)
+		work := make(chan models.RcloneUpload)
+		var wg sync.WaitGroup
+
+		// Feeder: stream rows, abort early on cancellation.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer close(work)
+			for _, row := range rows {
+				select {
+				case <-ctx.Done():
+					return
+				case work <- row:
+				}
+			}
+		}()
+
+		// Workers: one file at a time per CPU core — copyto + finalize.
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for row := range work {
+					if ctx.Err() != nil {
+						continue // cancelled: drain the remaining queue fast
+					}
+
+					rclone.MarkUploading(row.ID)
+					_, err := rclone.UploadFile(ctx, &remote, row.LocalPath, strings.TrimPrefix(row.RemotePath, remote.Name+":"), rclone.UploadArgs{Args: validatedFlags})
+					if err != nil {
+						logFn("ERROR", fmt.Sprintf("Failed to upload %s to %s: %v", filepath.Base(row.LocalPath), remote.Name, err))
+						rclone.MarkFailed(row.ID, err.Error())
+						atomic.AddInt64(&failed, 1)
+					} else {
+						rclone.FinalizeUpload(ctx, &remote, &row)
+						logFn("INFO", fmt.Sprintf("Uploaded %s to %s", filepath.Base(row.LocalPath), row.RemotePath))
+					}
+
+					finished := atomic.AddInt64(&done, 1)
+					db.DB.Model(job).Update("progress", int(finished*100/int64(total)))
+				}
+			}()
+		}
+		wg.Wait()
+
+		if ctx.Err() != nil {
+			logFn("WARN", "Cancelled mid-upload — remaining files stay queued for the retry cycle")
+			return context.Canceled
+		}
+
+		if failed > 0 {
+			return fmt.Errorf("%d/%d files failed to upload to %s", failed, total, remote.Name)
+		}
+
+		logFn("INFO", fmt.Sprintf("Successfully uploaded all %d file(s) to %s", total, remote.Name))
 		return nil
 	})
 
