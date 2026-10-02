@@ -1,10 +1,10 @@
 {
   "apps": [
     {
-      "app_id": "app_a8fead43-36bd-4876-b9cb-103c74487ea5",
-      "org_id": "user_dda79ac5-c8e0-4767-b2b6-73f5a180dc73",
-      "deploy_url": "https://push-n3-par-clevercloud-customers.services.clever-cloud.com/app_a8fead43-36bd-4876-b9cb-103c74487ea5.git",
-      "git_ssh_url": "git+ssh://git@push-n3-par-clevercloud-customers.services.clever-cloud.com/app_a8fead43-36bd-4876-b9cb-103c74487ea5.git",
+      "app_id": "app_ba699caf-4bb6-4722-a19b-35d0a6ab60e3",
+      "org_id": "user_4c9d29e9-dbe5-480f-a2c5-dfc3a6413894",
+      "deploy_url": "https://github.com/johnzhangee/clever-connect.git",
+      "git_ssh_url": "https://github.com/johnzhangee/clever-connect.git",
       "name": "clever-connect",
       "alias": "clever-connect"
     }
