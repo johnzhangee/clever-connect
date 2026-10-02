@@ -532,6 +532,41 @@ type RcloneUpload struct {
 	UpdatedAt         time.Time  `json:"updated_at"`
 }
 
+// RcloneFile is one object discovered on a provider remote and mirrored into
+// the database by the reconciliation engine (internal/rclone.SyncRemoteFiles).
+// It is the persistence layer that keeps files that exist on S3 and every
+// other storage provider visible and accessible in the UI after app
+// restarts: rows live in the SQL database, are refreshed from the provider on
+// every sync, and are re-created from a provider listing even when the local
+// transfer ledger was lost.
+type RcloneFile struct {
+	ID       uint `gorm:"primaryKey" json:"id"`
+	RemoteID uint `gorm:"index;uniqueIndex:idx_rclone_files_remote_path" json:"remote_id"`
+	// Path is the object path relative to the remote's RootPrefix, with
+	// forward slashes (e.g. "docs/report.pdf").
+	Path string `gorm:"type:varchar(1024)" json:"path"`
+	// PathHash is a stable SHA-256 of Path: together with RemoteID it forms
+	// the unique identity of one provider object (long varchar paths cannot
+	// be unique-indexed safely on MySQL utf8mb4).
+	PathHash string `gorm:"type:varchar(64);uniqueIndex:idx_rclone_files_remote_path" json:"path_hash"`
+	Name     string `gorm:"type:varchar(512)" json:"name"`
+	IsDir    bool   `gorm:"default:false" json:"is_dir"`
+	Size     int64  `json:"size"`
+	MimeType string `gorm:"type:varchar(191)" json:"mime_type"`
+	ModTime  *time.Time `json:"mod_time"`
+	// ProviderFileID is the backend's native object/document ID from lsjson.
+	ProviderFileID string `gorm:"type:varchar(512)" json:"provider_file_id"`
+	// PublicLink is a cached provider share link ("" when none was issued).
+	PublicLink string `gorm:"type:varchar(2048)" json:"public_link"`
+	LinkError  string `gorm:"type:text" json:"link_error"`
+	// LastSeenAt marks the last sync that observed the object on the
+	// provider; SyncedAt records when its metadata was last written.
+	LastSeenAt time.Time `json:"last_seen_at"`
+	SyncedAt   time.Time `json:"synced_at"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
 // RcloneSystem is the singleton (ID=1) engine settings row for the universal
 // cloud storage feature: which rclone binary to use and its state.
 type RcloneSystem struct {

@@ -4,6 +4,7 @@ import {
   FiCheckCircle, FiXCircle, FiClock, FiLoader, FiLink, FiCopy, FiSearch,
   FiArrowUp, FiUploadCloud, FiX, FiCloudOff, FiEye, FiEyeOff,
   FiExternalLink, FiInfo, FiHardDrive, FiGlobe, FiChevronDown,
+  FiDatabase, FiDownload,
 } from 'react-icons/fi';
 import { showGlobalAlert, showGlobalConfirm } from '../store/dialogStore';
 
@@ -13,13 +14,13 @@ interface EngineStatus {
   binary_ready: boolean; binary_path: string; binary_version: string;
   binary_source: string; auto_install: boolean; system_ok: boolean;
   remote_count: number; upload_count: number; provider_count: number;
-  secret_marker: string;
+  file_count: number; secret_marker: string;
 }
 
 interface ProviderOption {
   name: string; help: string; required: boolean; is_password: boolean;
   advanced: boolean; has_default: boolean; default: string;
-  examples: { value: string; help: string }[];
+  examples?: { value: string; help: string }[];
 }
 
 interface Provider {
@@ -30,6 +31,7 @@ interface Remote {
   id: number; name: string; type: string; root_prefix: string; extra_flags: string;
   enabled: boolean; options: Record<string, string>; secret_fields: string[];
   last_test_ok: boolean; last_test_error: string; last_test_at: string | null;
+  file_count: number; last_sync_at: string | null;
   created_at: string; updated_at: string;
 }
 
@@ -44,6 +46,15 @@ interface UploadRow {
 interface RemoteEntry {
   Name: string; Path: string; Size: number; IsDir: boolean;
   MimeType: string; ModTime: string; ID: string;
+}
+
+// One object of the persistent provider file index (backend rclone_files
+// table): everything that exists on the remote, refreshed by syncs.
+interface FileRow {
+  id: number; remote_id: number; path: string; name: string; is_dir: boolean;
+  size: number; mime_type: string; mod_time: string | null;
+  provider_file_id: string; public_link: string; link_error: string;
+  last_seen_at: string; synced_at: string;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -143,6 +154,19 @@ export const CloudStoragePage: React.FC = () => {
   const [filterRemote, setFilterRemote] = useState('');
   const [filterStatus, setFilterStatus] = useState('');
   const [copiedId, setCopiedId] = useState<number | null>(null);
+
+  // ── Indexed provider files state (restart-proof DB view) ──
+  const [filesRemote, setFilesRemote] = useState<Remote | null>(null);
+  const [fileRows, setFileRows] = useState<FileRow[]>([]);
+  const [fileTotal, setFileTotal] = useState(0);
+  const [fileSearch, setFileSearch] = useState('');
+  const [fileOffset, setFileOffset] = useState(0);
+  const [fileLastSync, setFileLastSync] = useState<string | null>(null);
+  const [filesLoading, setFilesLoading] = useState(false);
+  const [syncingId, setSyncingId] = useState<number | null>(null);
+  const [downloadingId, setDownloadingId] = useState<number | null>(null);
+  const [fileLinkId, setFileLinkId] = useState<number | null>(null);
+  const [copiedFileId, setCopiedFileId] = useState<number | null>(null);
 
   const activeProvider = providers.find(p => p.name === wizardType) || null;
 
@@ -264,7 +288,7 @@ export const CloudStoragePage: React.FC = () => {
     setWizardType(p.name);
     if (!editingRemote && !wizardName) setWizardName(p.name.replace(/[^a-z0-9_-]/g, '').slice(0, 24) || p.name);
     const seeded: Record<string, string> = {};
-    p.options.forEach(o => { if (o.has_default && o.default) seeded[o.name] = o.default; });
+    (p.options || []).forEach(o => { if (o.has_default && o.default) seeded[o.name] = o.default; });
     setOptionValues(seeded);
     setWizardStep(1);
   };
@@ -365,6 +389,87 @@ export const CloudStoragePage: React.FC = () => {
     } catch (e: any) { showGlobalAlert(e.message, { title: 'Toggle Failed', variant: 'error' }); }
   };
 
+  // ── Indexed provider files (DB-backed; survives restarts) ──
+  const loadFiles = useCallback(async (remote: Remote, search = '', offset = 0) => {
+    setFilesLoading(true);
+    try {
+      const q = new URLSearchParams();
+      if (search) q.set('search', search);
+      q.set('limit', '200');
+      if (offset > 0) q.set('offset', String(offset));
+      const r = await api(`/remotes/${remote.id}/files?${q.toString()}`);
+      const rows: FileRow[] = r.files || [];
+      setFileRows(prev => (offset === 0 ? rows : [...prev, ...rows]));
+      setFileTotal(r.total || 0);
+      setFileLastSync(r.last_sync_at || null);
+      setFileOffset(offset + rows.length);
+    } catch (e: any) {
+      showGlobalAlert(e.message, { title: 'Loading Files Failed', variant: 'error' });
+    } finally { setFilesLoading(false); }
+  }, [api]);
+
+  const openFiles = async (remote: Remote) => {
+    setFilesRemote(remote);
+    setFileSearch('');
+    setFileRows([]);
+    setFileOffset(0);
+    await loadFiles(remote, '', 0);
+  };
+
+  const syncRemote = async (remote: Remote) => {
+    setSyncingId(remote.id);
+    try {
+      const r = await api(`/remotes/${remote.id}/sync`, { method: 'POST' });
+      showGlobalAlert(
+        `Indexed ${r.files_seen} file(s) and ${r.dirs_seen} folder(s) — ${r.created} new, ${r.updated} updated, ${r.removed} removed.`,
+        { title: `${remote.name} synced`, variant: 'success' },
+      );
+      await refreshCore();
+      if (filesRemote?.id === remote.id) await loadFiles(remote, fileSearch, 0);
+    } catch (e: any) { showGlobalAlert(e.message, { title: 'Sync Failed', variant: 'error' }); }
+    finally { setSyncingId(null); }
+  };
+
+  const downloadFile = async (row: FileRow) => {
+    setDownloadingId(row.id);
+    try {
+      const res = await fetch(`${apiBase}/files/${row.id}/download`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        throw new Error(d.error || d.details || `HTTP ${res.status}`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = row.name || row.path.split('/').pop() || 'download';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e: any) { showGlobalAlert(e.message, { title: 'Download Failed', variant: 'error' }); }
+    finally { setDownloadingId(null); }
+  };
+
+  const fileLink = async (row: FileRow) => {
+    setFileLinkId(row.id);
+    try {
+      const r = await api(`/files/${row.id}/link`, { method: 'POST' });
+      showGlobalAlert(r.public_link, { title: 'Public Link Created', variant: 'success' });
+      if (filesRemote) await loadFiles(filesRemote, fileSearch, 0);
+    } catch (e: any) { showGlobalAlert(e.message, { title: 'Link Failed', variant: 'error' }); }
+    finally { setFileLinkId(null); }
+  };
+
+  const copyFileLink = async (row: FileRow) => {
+    if (!row.public_link) return;
+    try { await navigator.clipboard.writeText(row.public_link); } catch { /* clipboard denied */ }
+    setCopiedFileId(row.id);
+    setTimeout(() => setCopiedFileId(null), 1500);
+  };
+
   // ── Render ──
   const filteredProviders = (providerSearch
     ? providers.filter(p => p.name.includes(providerSearch.toLowerCase()) || p.description.toLowerCase().includes(providerSearch.toLowerCase()))
@@ -385,7 +490,7 @@ export const CloudStoragePage: React.FC = () => {
             </div>
             <div style={{ fontSize: 12, color: 'var(--color-brand-text)', marginTop: 2 }}>
               {status?.binary_ready
-                ? <>Engine ready ({status.binary_source}) — {status.provider_count} providers, {status.remote_count} remotes, {status.upload_count} uploads</>
+                ? <>Engine ready ({status.binary_source}) — {status.provider_count} providers, {status.remote_count} remotes, {status.upload_count} uploads, {status.file_count ?? 0} indexed files</>
                 : 'Engine binary missing — install it or set RCLONE_BINARY to enable cloud features'}
             </div>
           </div>
@@ -422,13 +527,14 @@ export const CloudStoragePage: React.FC = () => {
                 <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--color-brand-border)' }}>Name</th>
                 <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--color-brand-border)' }}>Provider</th>
                 <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--color-brand-border)' }}>Enabled</th>
+                <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--color-brand-border)' }}>Indexed Files</th>
                 <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--color-brand-border)' }}>Last Test</th>
                 <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--color-brand-border)', textAlign: 'right' }}>Actions</th>
               </tr>
             </thead>
             <tbody>
               {remotes.length === 0 && (
-                <tr><td colSpan={5} style={{ padding: '18px 10px', textAlign: 'center', color: 'var(--color-brand-muted)' }}>No remotes configured yet — add one to upload files to any cloud provider.</td></tr>
+                <tr><td colSpan={6} style={{ padding: '18px 10px', textAlign: 'center', color: 'var(--color-brand-muted)' }}>No remotes configured yet — add one to upload files to any cloud provider.</td></tr>
               )}
               {remotes.map(r => (
                 <tr key={r.id} style={{ borderBottom: '1px solid var(--color-brand-border)' }}>
@@ -436,6 +542,16 @@ export const CloudStoragePage: React.FC = () => {
                   <td style={{ padding: '9px 10px', color: 'var(--color-brand-text)' }}>{r.type}</td>
                   <td style={{ padding: '9px 10px' }}>
                     <input type="checkbox" checked={r.enabled} onChange={() => toggleRemoteEnabled(r)} />
+                  </td>
+                  <td style={{ padding: '9px 10px' }}>
+                    <button
+                      className="btn btn--sm"
+                      onClick={() => openFiles(r)}
+                      style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '3px 10px', fontSize: 12 }}
+                      title={r.last_sync_at ? `Last synced ${new Date(r.last_sync_at).toLocaleString()}` : 'Never synced — run a sync to index provider contents'}
+                    >
+                      <FiDatabase size={12} /> {r.file_count ?? 0}
+                    </button>
                   </td>
                   <td style={{ padding: '9px 10px' }}>
                     {r.last_test_at ? (
@@ -448,8 +564,14 @@ export const CloudStoragePage: React.FC = () => {
                     <button className="btn btn--sm" onClick={() => testRemote(r)} disabled={testingId === r.id} title="Test connectivity" style={{ marginRight: 4 }}>
                       <FiZap size={13} className={testingId === r.id ? 'spin-anim' : ''} />
                     </button>
-                    <button className="btn btn--sm" onClick={() => openBrowser(r)} title="Browse remote" style={{ marginRight: 4 }}>
+                    <button className="btn btn--sm" onClick={() => syncRemote(r)} disabled={syncingId === r.id} title="Re-index provider contents into the database" style={{ marginRight: 4 }}>
+                      <FiRefreshCw size={13} className={syncingId === r.id ? 'spin-anim' : ''} />
+                    </button>
+                    <button className="btn btn--sm" onClick={() => openBrowser(r)} title="Browse remote live" style={{ marginRight: 4 }}>
                       <FiFolder size={13} />
+                    </button>
+                    <button className="btn btn--sm" onClick={() => openFiles(r)} title="Browse indexed files" style={{ marginRight: 4 }}>
+                      <FiDatabase size={13} />
                     </button>
                     <button className="btn btn--sm" onClick={() => openWizard(r)} title="Edit remote" style={{ marginRight: 4 }}>
                       <FiEdit3 size={13} />
@@ -639,7 +761,7 @@ export const CloudStoragePage: React.FC = () => {
                             <input
                               type={o.is_password && !showSecrets[o.name] ? 'password' : 'text'}
                               value={val}
-                              placeholder={o.has_default ? o.default : (o.examples.length > 0 ? o.examples[0].value : '')}
+                              placeholder={o.has_default ? o.default : (o.examples && o.examples.length > 0 ? o.examples[0].value : '')}
                               onChange={e => setOptionValues(v => ({ ...v, [o.name]: e.target.value }))}
                               style={inputStyle}
                               autoComplete="off"
@@ -652,9 +774,9 @@ export const CloudStoragePage: React.FC = () => {
                             )}
                           </div>
                           {o.help && <div style={{ fontSize: 10.5, color: 'var(--color-brand-muted)', marginTop: 3 }}>{o.help.slice(0, 220)}</div>}
-                          {o.examples.length > 0 && (
+                          {(o.examples?.length ?? 0) > 0 && (
                             <div style={{ fontSize: 10, color: 'var(--color-brand-muted)', marginTop: 2 }}>
-                              e.g. {o.examples.slice(0, 2).map(x => x.value).join(' · ')}
+                              e.g. {(o.examples || []).slice(0, 2).map(x => x.value).join(' · ')}
                             </div>
                           )}
                         </div>
@@ -818,6 +940,123 @@ export const CloudStoragePage: React.FC = () => {
                   </tbody>
                 </table>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Indexed Provider Files (persistent across restarts) ── */}
+      {filesRemote && (
+        <div
+          onClick={e => { if (e.target === e.currentTarget) setFilesRemote(null); }}
+          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(4px)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}
+        >
+          <div className="g-card" style={{ width: 780, maxWidth: '100%', maxHeight: '88vh', display: 'flex', flexDirection: 'column', padding: 0 }}>
+            {/* Panel header */}
+            <div style={{ padding: '14px 20px', borderBottom: '1px solid var(--color-brand-border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 14, fontWeight: 700, color: 'var(--color-brand-heading)', overflow: 'hidden' }}>
+                <FiDatabase size={14} />
+                {filesRemote.name} — Files
+                <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--color-brand-muted)' }}>({fileTotal})</span>
+              </div>
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                <span style={{ fontSize: 10.5, color: 'var(--color-brand-muted)', whiteSpace: 'nowrap' }}>
+                  {fileLastSync ? `synced ${fmtDate(fileLastSync)}` : 'never synced'}
+                </span>
+                <button className="btn btn--sm" onClick={() => syncRemote(filesRemote)} disabled={syncingId === filesRemote.id} title="Re-index this provider's contents into the database">
+                  <FiRefreshCw size={13} className={syncingId === filesRemote.id ? 'spin-anim' : ''} />
+                </button>
+                <button className="btn btn--sm" onClick={() => setFilesRemote(null)}><FiX size={14} /></button>
+              </div>
+            </div>
+
+            {/* Search bar */}
+            <div style={{ padding: '10px 20px', borderBottom: '1px solid var(--color-brand-border)' }}>
+              <div style={{ position: 'relative' }}>
+                <FiSearch size={13} style={{ position: 'absolute', left: 12, top: 10, color: 'var(--color-brand-muted)' }} />
+                <input
+                  placeholder="Search indexed files by path…"
+                  value={fileSearch}
+                  onChange={e => setFileSearch(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') loadFiles(filesRemote, fileSearch, 0); }}
+                  style={{ ...inputStyle, paddingLeft: 34, fontSize: 13 }}
+                />
+              </div>
+            </div>
+            {/* Files table */}
+            <div style={{ overflowY: 'auto', flex: 1, maxHeight: '58vh' }}>
+              {filesLoading && fileRows.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: '50px 0', color: 'var(--color-brand-muted)', fontSize: 13 }}>
+                  <FiLoader className="spin-anim" size={20} style={{ display: 'block', margin: '0 auto 10px' }} />
+                  Loading indexed files…
+                </div>
+              ) : (
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                  <thead style={{ position: 'sticky', top: 0, background: 'var(--color-brand-bg)', zIndex: 1 }}>
+                    <tr style={{ textAlign: 'left', color: 'var(--color-brand-muted)', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                      <th style={{ padding: '8px 14px', borderBottom: '1px solid var(--color-brand-border)' }}>File</th>
+                      <th style={{ padding: '8px 14px', borderBottom: '1px solid var(--color-brand-border)', textAlign: 'right' }}>Size</th>
+                      <th style={{ padding: '8px 14px', borderBottom: '1px solid var(--color-brand-border)', textAlign: 'right' }}>Modified</th>
+                      <th style={{ padding: '8px 14px', borderBottom: '1px solid var(--color-brand-border)', textAlign: 'right' }}>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {fileRows.length === 0 && (
+                      <tr><td colSpan={4} style={{ padding: '22px 12px', textAlign: 'center', color: 'var(--color-brand-muted)' }}>
+                        No indexed files yet — run a sync to discover everything that exists on this provider.
+                      </td></tr>
+                    )}
+                    {fileRows.map(f => (
+                      <tr key={f.id} style={{ borderBottom: '1px solid var(--color-brand-border)' }}>
+                        <td style={{ padding: '9px 14px', maxWidth: 320 }}>
+                          <div style={{ fontWeight: 600, color: 'var(--color-brand-heading)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={f.path}>
+                            {f.is_dir ? <FiFolder size={13} style={{ verticalAlign: -2, marginRight: 5, color: 'var(--color-brand)' }} /> : null}
+                            {f.name || f.path.split('/').pop()}
+                          </div>
+                          <div style={{ fontSize: 10, color: 'var(--color-brand-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={f.path}>{f.path}</div>
+                        </td>
+                        <td style={{ padding: '9px 14px', textAlign: 'right', color: 'var(--color-brand-muted)', fontSize: 11, whiteSpace: 'nowrap' }}>{f.is_dir ? '—' : fmtBytes(f.size)}</td>
+                        <td style={{ padding: '9px 14px', textAlign: 'right', color: 'var(--color-brand-muted)', fontSize: 11, whiteSpace: 'nowrap' }}>{fmtDate(f.mod_time)}</td>
+                        <td style={{ padding: '9px 14px', textAlign: 'right', whiteSpace: 'nowrap' }}>
+                          {!f.is_dir && (
+                            <button className="btn btn--sm" onClick={() => downloadFile(f)} disabled={downloadingId === f.id} title="Download through the server" style={{ marginRight: 4 }}>
+                              {downloadingId === f.id ? <FiLoader size={12} className="spin-anim" /> : <FiDownload size={12} />}
+                            </button>
+                          )}
+                          {f.public_link ? (
+                            <>
+                              <a href={f.public_link} target="_blank" rel="noopener noreferrer" className="btn btn--sm" style={{ marginRight: 4 }} title={f.public_link}>
+                                <FiExternalLink size={12} />
+                              </a>
+                              <button className="btn btn--sm" onClick={() => copyFileLink(f)} title="Copy link" style={{ marginRight: 4 }}>
+                                {copiedFileId === f.id ? <FiCheckCircle size={12} style={{ color: '#22c55e' }} /> : <FiCopy size={12} />}
+                              </button>
+                            </>
+                          ) : !f.is_dir ? (
+                            <button className="btn btn--sm" onClick={() => fileLink(f)} disabled={fileLinkId === f.id} title={f.link_error || 'Create public link'} style={{ marginRight: 4 }}>
+                              {fileLinkId === f.id ? <FiLoader size={12} className="spin-anim" /> : <FiLink size={12} />}
+                            </button>
+                          ) : null}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+
+            {/* Footer */}
+            <div style={{ padding: '10px 20px', borderTop: '1px solid var(--color-brand-border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span style={{ fontSize: 11, color: 'var(--color-brand-muted)' }}>
+                Showing {fileRows.length} of {fileTotal} — stored in the database, visible after restarts.
+              </span>
+              <button
+                className="btn btn--sm"
+                disabled={filesLoading || fileRows.length >= fileTotal}
+                onClick={() => loadFiles(filesRemote, fileSearch, fileOffset)}
+              >
+                Load more
+              </button>
             </div>
           </div>
         </div>

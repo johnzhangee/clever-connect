@@ -167,8 +167,10 @@ func MarkFailed(id uint, errText string) {
 
 // FinalizeUpload runs post-transfer enrichment for one successfully uploaded
 // file: provider-side stat is stored as ProviderMeta (with the provider file
-// ID), and the requested public share link is created when enabled.
-// Enrichment failures are recorded on the row but never fail the transfer.
+// ID), the requested public share link is created when enabled, and the file
+// is mirrored into the persistent rclone_files index so it stays visible in
+// the UI after app restarts. Enrichment failures are recorded on the row but
+// never fail the transfer.
 func FinalizeUpload(ctx context.Context, remote *models.RcloneRemote, row *models.RcloneUpload) {
 	now := time.Now()
 	updates := map[string]interface{}{
@@ -176,8 +178,10 @@ func FinalizeUpload(ctx context.Context, remote *models.RcloneRemote, row *model
 		"transferred_at": now,
 	}
 
+	var statEntry *RemoteEntry
 	if raw, entry, err := Stat(ctx, remote, row.RemotePath); err == nil {
 		updates["provider_meta"] = raw
+		statEntry = entry
 		if entry != nil && entry.ID != "" {
 			updates["provider_file_id"] = entry.ID
 		}
@@ -200,5 +204,15 @@ func FinalizeUpload(ctx context.Context, remote *models.RcloneRemote, row *model
 		logger.Error("Rclone", "failed finalizing upload record", "row", row.ID, "error", err)
 	} else {
 		logger.Info("Rclone", "upload finalized", "row", row.ID, "remote", row.RemotePath)
+	}
+
+	// Mirror the freshly uploaded object into the persistent provider index.
+	if fileRow := UpsertRemoteFile(remote, row.RemotePath, statEntry); fileRow != nil {
+		if link, ok := updates["public_link"].(string); ok && link != "" {
+			db.DB.Model(fileRow).Updates(map[string]interface{}{
+				"public_link": link,
+				"link_error":  "",
+			})
+		}
 	}
 }

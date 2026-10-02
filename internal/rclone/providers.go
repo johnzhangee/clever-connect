@@ -117,6 +117,15 @@ func fetchProviders(ctx context.Context) ([]RcloneProvider, error) {
 	})
 	for i := range provs {
 		provs[i].HasOAuth = providerHasOAuth(&provs[i])
+		// rclone omits "Examples" (or emits an empty array) for most options.
+		// Normalize nils to empty slices so the API layer can always render
+		// "examples": [] instead of dropping the key — the wizard form reads
+		// .length on it and crashed when the key was missing.
+		for j := range provs[i].Options {
+			if provs[i].Options[j].Examples == nil {
+				provs[i].Options[j].Examples = []Example{}
+			}
+		}
 	}
 	return provs, nil
 }

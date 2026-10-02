@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -156,6 +157,7 @@ func (h *RcloneHandler) remoteResponse(remote *models.RcloneRemote) gin.H {
 	if err != nil {
 		maskedOptions = map[string]string{}
 	}
+	fileCount, lastSync := rclone.RemoteFileStats(remote.ID)
 	return gin.H{
 		"id":              remote.ID,
 		"name":            remote.Name,
@@ -168,6 +170,8 @@ func (h *RcloneHandler) remoteResponse(remote *models.RcloneRemote) gin.H {
 		"last_test_ok":    remote.LastTestOk,
 		"last_test_error": remote.LastTestError,
 		"last_test_at":    remote.LastTestAt,
+		"file_count":      fileCount,
+		"last_sync_at":    lastSync,
 		"created_at":      remote.CreatedAt,
 		"updated_at":      remote.UpdatedAt,
 	}
@@ -179,9 +183,10 @@ func (h *RcloneHandler) GetStatus(c *gin.Context) {
 		return
 	}
 
-	var remoteCount, uploadCount int64
+	var remoteCount, uploadCount, fileCount int64
 	db.DB.Model(&models.RcloneRemote{}).Count(&remoteCount)
 	db.DB.Model(&models.RcloneUpload{}).Count(&uploadCount)
+	db.DB.Model(&models.RcloneFile{}).Count(&fileCount)
 
 	envPath := strings.TrimSpace(os.Getenv(rclone.BinEnvVar))
 	sys, sysErr := rclone.System()
@@ -221,6 +226,7 @@ func (h *RcloneHandler) GetStatus(c *gin.Context) {
 		"system_ok":      sysErr == nil,
 		"remote_count":   remoteCount,
 		"upload_count":   uploadCount,
+		"file_count":     fileCount,
 		"provider_count": providerCount,
 		"secret_marker":  rclone.SecretMarker,
 	})
@@ -294,7 +300,9 @@ type providerOptionOut struct {
 	Advanced   bool             `json:"advanced"`
 	HasDefault bool             `json:"has_default"`
 	Default    string           `json:"default,omitempty"`
-	Examples   []rclone.Example `json:"examples,omitempty"`
+	// No omitempty: the wizard form reads examples.length and crashes when
+	// the key is absent. Empty examples must serialize as [].
+	Examples   []rclone.Example `json:"examples"`
 }
 
 // providerOut is the trimmed provider shape for the wizard's provider picker.
@@ -329,6 +337,13 @@ func (h *RcloneHandler) GetProviders(c *gin.Context) {
 				hasDef = true
 				_ = json.Unmarshal(o.Default, &def)
 			}
+			// Belt and braces: never hand the API a nil Examples slice —
+			// without omitempty it would serialize as null, and the form
+			// reads .length on it.
+			ex := o.Examples
+			if ex == nil {
+				ex = []rclone.Example{}
+			}
 			opts = append(opts, providerOptionOut{
 				Name:       o.Name,
 				Help:       o.Help,
@@ -337,7 +352,7 @@ func (h *RcloneHandler) GetProviders(c *gin.Context) {
 				Advanced:   o.Advanced,
 				HasDefault: hasDef,
 				Default:    def,
-				Examples:   o.Examples,
+				Examples:   ex,
 			})
 		}
 		out = append(out, providerOut{Name: p.Name, Description: p.Description, HasOAuth: p.HasOAuth, Options: opts})
@@ -549,6 +564,9 @@ func (h *RcloneHandler) DeleteRemote(c *gin.Context) {
 	if c.Query("purge_uploads") == "1" {
 		db.DB.Where("remote_id = ?", remote.ID).Delete(&models.RcloneUpload{})
 	}
+
+	// The persistent provider file index belongs to this remote exclusively.
+	db.DB.Where("remote_id = ?", remote.ID).Delete(&models.RcloneFile{})
 
 	if err := db.DB.Delete(&remote).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete remote", "details": err.Error()})
@@ -844,6 +862,10 @@ func (h *RcloneHandler) DeleteUpload(c *gin.Context) {
 		if err := db.DB.First(&remote, row.RemoteID).Error; err == nil {
 			if err := rclone.DeleteObject(c.Request.Context(), &remote, row.RemotePath); err != nil {
 				purgeErr = err.Error()
+			} else {
+				// Object gone from the provider: drop it from the persistent
+				// provider file index too so the UI matches the remote again.
+				rclone.RemoveIndexedFile(&remote, row.RemotePath)
 			}
 		}
 	}
@@ -854,4 +876,206 @@ func (h *RcloneHandler) DeleteUpload(c *gin.Context) {
 	}
 	logger.Info("Rclone", "Upload record deleted", "row", row.ID, "purge", c.Query("purge") == "1", "ip", c.ClientIP())
 	c.JSON(http.StatusOK, gin.H{"status": "success", "message": "Upload record deleted", "purge_error": purgeErr})
+}
+
+// RemoteFiles handles GET /api/rclone/remotes/:id/files?search=&include_dirs=1&limit=&offset=
+// — the DB-backed provider file index. It survives app restarts and is what
+// keeps files that exist on S3/Drive/... visible in the UI.
+func (h *RcloneHandler) RemoteFiles(c *gin.Context) {
+	if h.proxyToServer(c, c.Request.Method, c.Request.URL.Path) {
+		return
+	}
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid remote id"})
+		return
+	}
+	var remote models.RcloneRemote
+	if err := db.DB.First(&remote, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Remote not found"})
+		return
+	}
+
+	query := db.DB.Model(&models.RcloneFile{}).Where("remote_id = ?", remote.ID)
+	if c.Query("include_dirs") != "1" {
+		query = query.Where("is_dir = ?", false)
+	}
+	if search := strings.TrimSpace(c.Query("search")); search != "" {
+		query = query.Where("path LIKE ?", "%"+search+"%")
+	}
+
+	var total int64
+	query.Count(&total)
+
+	limit := 200
+	if l, err := strconv.Atoi(c.Query("limit")); err == nil && l > 0 && l <= 500 {
+		limit = l
+	}
+	offset := 0
+	if o, err := strconv.Atoi(c.Query("offset")); err == nil && o > 0 {
+		offset = o
+	}
+
+	var rows []models.RcloneFile
+	query.Order("path ASC").Limit(limit).Offset(offset).Find(&rows)
+
+	_, lastSync := rclone.RemoteFileStats(remote.ID)
+	c.JSON(http.StatusOK, gin.H{
+		"files":        rows,
+		"total":        total,
+		"limit":        limit,
+		"offset":       offset,
+		"last_sync_at": lastSync,
+		"remote": gin.H{
+			"id":          remote.ID,
+			"name":        remote.Name,
+			"type":        remote.Type,
+			"root_prefix": remote.RootPrefix,
+		},
+	})
+}
+
+// SyncRemote handles POST /api/rclone/remotes/:id/sync — re-indexes the
+// provider's current contents into the persistent file table.
+func (h *RcloneHandler) SyncRemote(c *gin.Context) {
+	if h.proxyToServer(c, c.Request.Method, c.Request.URL.Path) {
+		return
+	}
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid remote id"})
+		return
+	}
+	var remote models.RcloneRemote
+	if err := db.DB.First(&remote, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Remote not found"})
+		return
+	}
+
+	if _, err := rclone.EnsureBinary(c.Request.Context()); err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Cloud storage engine binary unavailable", "details": err.Error()})
+		return
+	}
+
+	// Big buckets can take minutes to enumerate; the request context governs.
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Minute)
+	defer cancel()
+	report, err := rclone.SyncRemoteFiles(ctx, &remote)
+	if err != nil {
+		logger.Warn("Rclone", "Remote file index sync failed", "remote", remote.Name, "error", err, "ip", c.ClientIP())
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Remote sync failed", "details": err.Error()})
+		return
+	}
+	logger.Info("Rclone", "Remote file index synced",
+		"remote", remote.Name, "files", report.FilesSeen, "created", report.Created,
+		"updated", report.Updated, "removed", report.Removed, "ip", c.ClientIP())
+	c.JSON(http.StatusOK, report)
+}
+
+// lazyFileWriter delays the HTTP status/headers until the first byte arrives
+// from the provider so a failed `rclone cat` can still produce a clean JSON
+// error instead of a corrupted 200 stream.
+type lazyFileWriter struct {
+	c           *gin.Context
+	name        string
+	mimeType    string
+	headersSent bool
+	Wrote       int64
+}
+
+func (w *lazyFileWriter) Write(p []byte) (int, error) {
+	if !w.headersSent {
+		w.headersSent = true
+		w.c.Header("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": w.name}))
+		if w.mimeType != "" {
+			w.c.Header("Content-Type", w.mimeType)
+		} else {
+			w.c.Header("Content-Type", "application/octet-stream")
+		}
+		w.c.Status(http.StatusOK)
+	}
+	n, err := w.c.Writer.Write(p)
+	w.Wrote += int64(n)
+	return n, err
+}
+
+// FileDownload handles GET /api/rclone/files/:id/download — streams one
+// indexed provider object straight through `rclone cat` to the response.
+func (h *RcloneHandler) FileDownload(c *gin.Context) {
+	if h.proxyToServer(c, c.Request.Method, c.Request.URL.Path) {
+		return
+	}
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid file id"})
+		return
+	}
+	var fileRow models.RcloneFile
+	if err := db.DB.First(&fileRow, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "File record not found"})
+		return
+	}
+	var remote models.RcloneRemote
+	if err := db.DB.First(&remote, fileRow.RemoteID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Owning remote no longer exists"})
+		return
+	}
+
+	if _, err := rclone.EnsureBinary(c.Request.Context()); err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Cloud storage engine binary unavailable", "details": err.Error()})
+		return
+	}
+
+	w := &lazyFileWriter{c: c, name: fileRow.Name, mimeType: fileRow.MimeType}
+	err = rclone.StreamFile(c.Request.Context(), &remote, rclone.FileFullPath(&remote, &fileRow), w)
+	if err != nil {
+		if !w.headersSent {
+			c.JSON(http.StatusBadGateway, gin.H{"error": "File download failed", "details": err.Error()})
+			return
+		}
+		// Headers are already on the wire — nothing recoverable left to send.
+		logger.Warn("Rclone", "Download stream aborted mid-transfer", "file", fileRow.Path, "remote", remote.Name, "error", err)
+		return
+	}
+	logger.Info("Rclone", "File downloaded from provider", "file", fileRow.Path, "remote", remote.Name, "bytes", w.Wrote, "ip", c.ClientIP())
+}
+
+// FileLink handles POST /api/rclone/files/:id/link — issues/refreshes the
+// provider public link for one indexed file and caches it on the row.
+func (h *RcloneHandler) FileLink(c *gin.Context) {
+	if h.proxyToServer(c, c.Request.Method, c.Request.URL.Path) {
+		return
+	}
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid file id"})
+		return
+	}
+	var fileRow models.RcloneFile
+	if err := db.DB.First(&fileRow, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "File record not found"})
+		return
+	}
+	var remote models.RcloneRemote
+	if err := db.DB.First(&remote, fileRow.RemoteID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Owning remote no longer exists"})
+		return
+	}
+
+	link, err := rclone.CreateLink(c.Request.Context(), &remote, rclone.FileFullPath(&remote, &fileRow))
+	if err != nil {
+		db.DB.Model(&fileRow).Update("link_error", err.Error())
+		if rclone.IsOptionalOpError(err) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "This provider does not support public links", "details": err.Error()})
+			return
+		}
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to create public link", "details": err.Error()})
+		return
+	}
+
+	db.DB.Model(&fileRow).Updates(map[string]interface{}{
+		"public_link": link,
+		"link_error":  "",
+	})
+	c.JSON(http.StatusOK, gin.H{"status": "success", "public_link": link})
 }

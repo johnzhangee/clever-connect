@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"io/fs"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"clever-connect/internal/handlers"
 	"clever-connect/internal/logger"
 	"clever-connect/internal/models"
+	"clever-connect/internal/rclone"
 	"clever-connect/internal/scheduler"
 	"clever-connect/internal/soroush"
 	"clever-connect/internal/spotify"
@@ -118,6 +120,12 @@ func main() {
 
 		// Initialize Enterprise Job Scheduler Engine
 		scheduler.Init()
+
+		// Re-index every configured cloud storage remote (S3, Drive,
+		// Dropbox, SFTP, ...) into the rclone_files database table so files
+		// that exist on the providers are visible and accessible in the UI
+		// immediately after a restart, whatever happened to local state.
+		go rclone.ReconcileAllRemotes(context.Background())
 	}
 
 	// Auto-start active tunnel engine on bootstrap
@@ -534,6 +542,10 @@ func main() {
 			protected.DELETE("/rclone/remotes/:id", rcloneHandler.DeleteRemote)
 			protected.POST("/rclone/remotes/:id/test", rcloneHandler.TestRemote)
 			protected.POST("/rclone/remotes/:id/list", rcloneHandler.ListRemoteDir)
+			protected.GET("/rclone/remotes/:id/files", rcloneHandler.RemoteFiles)
+			protected.POST("/rclone/remotes/:id/sync", rcloneHandler.SyncRemote)
+			protected.GET("/rclone/files/:id/download", rcloneHandler.FileDownload)
+			protected.POST("/rclone/files/:id/link", rcloneHandler.FileLink)
 			protected.POST("/rclone/upload", rcloneHandler.StartUpload)
 			protected.GET("/rclone/uploads", rcloneHandler.ListUploads)
 			protected.POST("/rclone/uploads/:id/link", rcloneHandler.RefreshUploadLink)
