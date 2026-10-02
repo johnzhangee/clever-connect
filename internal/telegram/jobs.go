@@ -2,8 +2,10 @@ package telegram
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"mime"
 	"net/url"
 	"os"
@@ -22,7 +24,6 @@ import (
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/message"
 	"github.com/gotd/td/telegram/message/html"
-	"github.com/gotd/td/telegram/message/styling"
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
 	tele "gopkg.in/telebot.v4"
@@ -80,51 +81,22 @@ func (p *uploadProgress) Chunk(ctx context.Context, state uploader.ProgressState
 	// Throttle Telegram status message updates (max once per 1.5 seconds) to avoid rate limits
 	if time.Since(p.lastUpdate) > 1500*time.Millisecond {
 		p.lastUpdate = time.Now()
-		
+
 		elapsed := time.Since(p.startTime).Seconds()
 		speed := 0.0
 		if elapsed > 0 {
 			speed = float64(state.Uploaded) / elapsed / (1024 * 1024) // MB/s
 		}
 
-		progressText := formatUploadProgressText(p.fileName, state.Uploaded, state.Total, percent, speed, elapsed)
+		progressText := formatUploadProgressHTML(p.fileName, state.Uploaded, state.Total, percent, speed, elapsed)
 
 		if p.progressMsg != nil && p.eng.Bot != nil {
-			btnRestart := tele.InlineButton{
-				Text:   "🔄 Restart Job",
-				Unique: "restart_job",
-				Data:   fmt.Sprintf("%d", p.job.ID),
-			}
-			inlineMarkup := &tele.ReplyMarkup{
-				InlineKeyboard: [][]tele.InlineButton{
-					{btnRestart},
-				},
-			}
 			_, _ = p.eng.Bot.Edit(p.progressMsg, progressText, &tele.SendOptions{
-				ParseMode:   tele.ModeMarkdown,
-				ReplyMarkup: inlineMarkup,
+				ParseMode:   tele.ModeHTML,
+				ReplyMarkup: restartJobMarkupBot(p.job.ID),
 			})
 		} else if p.gotdClient != nil && p.gotdPeer != nil && p.gotdMsgID != 0 {
-			api := tg.NewClient(p.gotdClient)
-			htmlText := mdToHTML(progressText)
-			kbMarkup := &tg.ReplyInlineMarkup{
-				Rows: []tg.KeyboardButtonRow{
-					{
-						Buttons: []tg.KeyboardButtonClass{
-							&tg.KeyboardButtonCallback{
-								Text: "🔄 Restart Job",
-								Data: []byte(fmt.Sprintf("restart_job:%d", p.job.ID)),
-							},
-						},
-					},
-				},
-			}
-			_, _ = api.MessagesEditMessage(ctx, &tg.MessagesEditMessageRequest{
-				Peer:        p.gotdPeer,
-				ID:          p.gotdMsgID,
-				Message:     htmlText,
-				ReplyMarkup: kbMarkup,
-			})
+			_ = editGotdMessageHTML(ctx, tg.NewClient(p.gotdClient), p.gotdPeer, p.gotdMsgID, progressText, restartJobMarkupGotd(p.job.ID))
 		}
 	}
 	return nil
@@ -231,22 +203,11 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 	// Send initial progress text message via the active telebot instance
 	var progressMsg *tele.Message
 	if eng.Bot != nil {
-		initialText := formatUploadInitialText(fileName, info.Size())
-		
-		btnRestart := tele.InlineButton{
-			Text:   "🔄 Restart Job",
-			Unique: "restart_job",
-			Data:   fmt.Sprintf("%d", job.ID),
-		}
-		inlineMarkup := &tele.ReplyMarkup{
-			InlineKeyboard: [][]tele.InlineButton{
-				{btnRestart},
-			},
-		}
+		initialText := formatUploadInitialHTML(fileName, info.Size())
 
 		msg, err := eng.Bot.Send(tele.ChatID(chatID), initialText, &tele.SendOptions{
-			ParseMode:   tele.ModeMarkdown,
-			ReplyMarkup: inlineMarkup,
+			ParseMode:   tele.ModeHTML,
+			ReplyMarkup: restartJobMarkupBot(job.ID),
 		})
 		if err != nil {
 			logFn("WARN", fmt.Sprintf("Failed to send initial progress message to Telegram: %v", err))
@@ -277,23 +238,11 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 
 	if eng.Bot == nil {
 		// User mode: send initial progress message via MTProto client
-		initialText := formatUploadInitialText(fileName, info.Size())
+		initialText := formatUploadInitialHTML(fileName, info.Size())
 
 		sender := message.NewSender(api)
-		htmlText := mdToHTML(initialText)
-		kbMarkup := &tg.ReplyInlineMarkup{
-			Rows: []tg.KeyboardButtonRow{
-				{
-					Buttons: []tg.KeyboardButtonClass{
-						&tg.KeyboardButtonCallback{
-							Text: "🔄 Restart Job",
-							Data: []byte(fmt.Sprintf("restart_job:%d", job.ID)),
-						},
-					},
-				},
-			},
-		}
-		msg, err := sender.To(peer).Markup(kbMarkup).StyledText(eng.gotdCtx, html.String(nil, htmlText))
+		kbMarkup := restartJobMarkupGotd(job.ID)
+		msg, err := sender.To(peer).Markup(kbMarkup).StyledText(eng.gotdCtx, html.String(nil, initialText))
 		if err == nil {
 			if upd, ok := msg.(*tg.UpdateShortSentMessage); ok {
 				pMsgID = upd.ID
@@ -308,6 +257,19 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 		} else {
 			logFn("WARN", fmt.Sprintf("Failed to send initial progress message to Telegram (MTProto): %v", err))
 		}
+	}
+
+	// Ensure the media Telegram receives is instantly playable: MP4s get a
+	// faststart remux when the moov atom is at the end, and MKV/AVI/etc are
+	// remuxed to MP4 when the codecs allow it (lossless stream copy).
+	if prepPath, prepName, prepCleanup := preparePlayableMedia(safePath, fileName, logFn); prepPath != safePath {
+		safePath = prepPath
+		fileName = prepName
+		defer prepCleanup()
+		if st, statErr := os.Stat(safePath); statErr == nil {
+			info = st
+		}
+		logFn("INFO", fmt.Sprintf("Uploading playable remux: %s (size %s)", fileName, formatFileSize(info.Size())))
 	}
 
 	// Use dynamic thread count based on file size (devgagantools-style)
@@ -369,14 +331,16 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 
 	logFn("INFO", "Assembling media post...")
 	ext := strings.ToLower(filepath.Ext(fileName))
-	caption := fmt.Sprintf("🎬 *CleverConnect Professional Share*\n\n"+
-		"📄 *File Name:* `%s`\n"+
-		"📏 *File Size:* `%s`\n"+
-		"🕒 *Uploaded At:* `%s`\n\n"+
-		"⚡ _Powered by CleverConnect Job Scheduler_",
-		fileName,
-		formatFileSize(info.Size()),
-		time.Now().Format("2006-01-02 15:04:05"),
+	caption := fmt.Sprintf("🎬 <b>CleverConnect Share</b>\n"+
+		"━━━━━━━━━━━━━━━━━━━━━━\n\n"+
+		"📄 <b>File:</b> <code>%s</code>\n"+
+		"📦 <b>Size:</b> <code>%s</code>\n"+
+		"📅 <b>Uploaded:</b> <code>%s</code>\n\n"+
+		"━━━━━━━━━━━━━━━━━━━━━━\n"+
+		"🔷 <i>CleverConnect Engine</i>",
+		escapeHTML(fileName),
+		escapeHTML(formatFileSize(info.Size())),
+		time.Now().Format("2006-01-02 15:04"),
 	)
 
 	var mediaOption message.MediaOption
@@ -387,7 +351,7 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 
 	switch ext {
 	case ".jpg", ".jpeg", ".png", ".gif":
-		mediaOption = message.UploadedPhoto(inputFile, styling.Plain(caption))
+		mediaOption = message.UploadedPhoto(inputFile, html.String(nil, caption))
 	case ".mp4", ".mkv", ".webm", ".avi", ".mov":
 		w, h, duration, videoCodec, audioCodec, totalBitrate, title, artist := probeMediaMetadata(safePath)
 
@@ -411,33 +375,35 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 			bitrateStr = formatBitrate(totalBitrate)
 		}
 
-		videoCaption := fmt.Sprintf("🎬 *CleverConnect Premium Share*\n\n"+
-			"📄 *File Name:* `%s`\n"+
-			"📏 *File Size:* `%s`\n"+
-			"🕒 *Duration:* `%s`\n"+
-			"🖥️ *Resolution:* `%s`\n"+
-			"⚙️ *Codecs:* `%s`\n"+
-			"⚡ *Bitrate:* `%s`\n"+
-			"📅 *Uploaded:* `%s`\n\n"+
-			"⚡ _Powered by CleverConnect Job Scheduler_",
-			fileName,
-			formatFileSize(info.Size()),
+		videoCaption := fmt.Sprintf("🎬 <b>CleverConnect Premium Share</b>\n"+
+			"━━━━━━━━━━━━━━━━━━━━━━\n\n"+
+			"📄 <b>File:</b> <code>%s</code>\n"+
+			"📦 <b>Size:</b> <code>%s</code>\n"+
+			"🕒 <b>Duration:</b> <code>%s</code>\n"+
+			"🖥 <b>Resolution:</b> <code>%s</code>\n"+
+			"⚙️ <b>Codecs:</b> <code>%s</code>\n"+
+			"⚡ <b>Bitrate:</b> <code>%s</code>\n"+
+			"📅 <b>Uploaded:</b> <code>%s</code>\n\n"+
+			"━━━━━━━━━━━━━━━━━━━━━━\n"+
+			"🔷 <i>CleverConnect Engine</i>",
+			escapeHTML(fileName),
+			escapeHTML(formatFileSize(info.Size())),
 			durationStr,
 			resStr,
 			codecStr,
 			bitrateStr,
-			time.Now().Format("2006-01-02 15:04:05"),
+			time.Now().Format("2006-01-02 15:04"),
 		)
 
 		if title != "" {
-			prefix := fmt.Sprintf("🎵 *Title:* `%s`", title)
+			prefix := fmt.Sprintf("🎵 <b>Title:</b> <code>%s</code>", escapeHTML(title))
 			if artist != "" {
-				prefix += fmt.Sprintf(" - `%s`", artist)
+				prefix += fmt.Sprintf(" — <code>%s</code>", escapeHTML(artist))
 			}
 			videoCaption = prefix + "\n" + videoCaption
 		}
 
-		doc := message.UploadedDocument(inputFile, styling.Plain(videoCaption))
+		doc := message.UploadedDocument(inputFile, html.String(nil, videoCaption))
 		mimeStr := "video/mp4"
 		if ext == ".mkv" {
 			mimeStr = "video/x-matroska"
@@ -460,28 +426,30 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 
 	case ".mp3", ".m4a", ".flac", ".wav":
 		_, _, duration, _, _, _, title, artist := probeMediaMetadata(safePath)
-		
-		audioCaption := fmt.Sprintf("🎵 *CleverConnect Audio Share*\n\n"+
-			"📄 *File Name:* `%s`\n"+
-			"📏 *File Size:* `%s`\n"+
-			"🕒 *Duration:* `%s`\n"+
-			"📅 *Uploaded:* `%s`\n\n"+
-			"⚡ _Powered by CleverConnect Job Scheduler_",
-			fileName,
-			formatFileSize(info.Size()),
+
+		audioCaption := fmt.Sprintf("🎵 <b>CleverConnect Audio Share</b>\n"+
+			"━━━━━━━━━━━━━━━━━━━━━━\n\n"+
+			"📄 <b>File:</b> <code>%s</code>\n"+
+			"📦 <b>Size:</b> <code>%s</code>\n"+
+			"🕒 <b>Duration:</b> <code>%s</code>\n"+
+			"📅 <b>Uploaded:</b> <code>%s</code>\n\n"+
+			"━━━━━━━━━━━━━━━━━━━━━━\n"+
+			"🔷 <i>CleverConnect Engine</i>",
+			escapeHTML(fileName),
+			escapeHTML(formatFileSize(info.Size())),
 			formatDuration(duration),
-			time.Now().Format("2006-01-02 15:04:05"),
+			time.Now().Format("2006-01-02 15:04"),
 		)
 
 		if title != "" {
-			prefix := fmt.Sprintf("🎵 *Title:* `%s`", title)
+			prefix := fmt.Sprintf("🎵 <b>Title:</b> <code>%s</code>", escapeHTML(title))
 			if artist != "" {
-				prefix += fmt.Sprintf(" - `%s`", artist)
+				prefix += fmt.Sprintf(" — <code>%s</code>", escapeHTML(artist))
 			}
 			audioCaption = prefix + "\n" + audioCaption
 		}
 
-		doc := message.UploadedDocument(inputFile, styling.Plain(audioCaption))
+		doc := message.UploadedDocument(inputFile, html.String(nil, audioCaption))
 		audioBuilder := doc.MIME(mimeType).Filename(fileName).Audio()
 		if duration > 0 {
 			audioBuilder = audioBuilder.DurationSeconds(duration)
@@ -498,7 +466,7 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 
 	case ".ogg", ".opus":
 		_, _, duration, _, _, _, _, _ := probeMediaMetadata(safePath)
-		doc := message.UploadedDocument(inputFile, styling.Plain(caption))
+		doc := message.UploadedDocument(inputFile, html.String(nil, caption))
 		audioBuilder := doc.MIME(mimeType).Filename(fileName).Audio().Voice()
 		if duration > 0 {
 			audioBuilder = audioBuilder.DurationSeconds(duration)
@@ -506,7 +474,7 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 		mediaOption = audioBuilder
 
 	default:
-		doc := message.UploadedDocument(inputFile, styling.Plain(caption))
+		doc := message.UploadedDocument(inputFile, html.String(nil, caption))
 		doc.MIME(mimeType).Filename(fileName)
 		mediaOption = doc
 	}
@@ -535,15 +503,11 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 	if mediaSentErr != nil {
 		// Attempt to update the progress message with error
 		errMsg := fmt.Sprintf("failed to send media post: %v", mediaSentErr)
-		errorText := formatErrorText(true, fileName, errMsg)
+		errorText := formatErrorHTML(true, fileName, errMsg)
 		if progressMsg != nil && eng.Bot != nil {
-			_, _ = eng.Bot.Edit(progressMsg, errorText, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+			_, _ = eng.Bot.Edit(progressMsg, errorText, &tele.SendOptions{ParseMode: tele.ModeHTML})
 		} else if pMsgID != 0 && pPeer != nil {
-			_, _ = api.MessagesEditMessage(eng.gotdCtx, &tg.MessagesEditMessageRequest{
-				Peer:    pPeer,
-				ID:      pMsgID,
-				Message: mdToHTML(errorText),
-			})
+			_ = editGotdMessageHTML(eng.gotdCtx, api, pPeer, pMsgID, errorText, nil)
 		}
 		return fmt.Errorf("%s", errMsg)
 	}
@@ -725,7 +689,6 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 		return fmt.Errorf("telegram bot engine is not initialized or running")
 	}
 
-
 	if eng.gotdClient == nil {
 		return fmt.Errorf("MTProto client is not initialized")
 	}
@@ -754,12 +717,16 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 	var fileSize int64
 	var fileName string
 	var hasFile bool
+	var fileDCID int
 
 	switch media := msg.Media.(type) {
 	case *tg.MessageMediaDocument:
 		if doc, ok := media.Document.(*tg.Document); ok {
 			fileSize = doc.Size
 			hasFile = true
+			// DCID is the authoritative home datacenter of the file. The fast
+			// multi-connection download pool targets it directly.
+			fileDCID = doc.DCID
 			fileLocation = &tg.InputDocumentFileLocation{
 				ID:            doc.ID,
 				AccessHash:    doc.AccessHash,
@@ -784,6 +751,7 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 	case *tg.MessageMediaPhoto:
 		if photo, ok := media.Photo.(*tg.Photo); ok {
 			hasFile = true
+			fileDCID = photo.DCID
 			fileName = fmt.Sprintf("photo_%d.jpg", photo.ID)
 			fileLocation = &tg.InputPhotoFileLocation{
 				ID:            photo.ID,
@@ -874,13 +842,13 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 				absoluteDownloadURL = fmt.Sprintf("https://ondata.ir%s", downloadPath)
 			}
 
-			successText := formatSuccessText(false, fileName, fileSize, relPath)
+			successText := formatSuccessHTML(false, fileName, fileSize, relPath)
 
 			if eng.Bot != nil {
 				kb := &tele.ReplyMarkup{}
 				btn := kb.URL("📥 Download Direct Link", absoluteDownloadURL)
 				kb.Inline(kb.Row(btn))
-				_, _ = eng.Bot.Send(tele.ChatID(payload.ChatID), successText, &tele.SendOptions{ParseMode: tele.ModeMarkdown, ReplyMarkup: kb})
+				_, _ = eng.Bot.Send(tele.ChatID(payload.ChatID), successText, &tele.SendOptions{ParseMode: tele.ModeHTML, ReplyMarkup: kb})
 			} else {
 				kbMarkup := &tg.ReplyInlineMarkup{
 					Rows: []tg.KeyboardButtonRow{
@@ -895,8 +863,7 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 					},
 				}
 				sender := message.NewSender(api)
-				htmlText := mdToHTML(successText)
-				_, _ = sender.To(peer).Markup(kbMarkup).StyledText(eng.gotdCtx, html.String(nil, htmlText))
+				_, _ = sender.To(peer).Markup(kbMarkup).StyledText(eng.gotdCtx, html.String(nil, successText))
 			}
 
 			return nil
@@ -906,22 +873,12 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 	// 5. Send initial progress message
 	var progressMsg *tele.Message
 	var pMsgID int
-	initialText := formatDownloadInitialText(fileName, fileSize)
+	initialText := formatDownloadInitialHTML(fileName, fileSize)
 
 	if eng.Bot != nil {
-		btnRestart := tele.InlineButton{
-			Text:   "🔄 Restart Job",
-			Unique: "restart_job",
-			Data:   fmt.Sprintf("%d", job.ID),
-		}
-		inlineMarkup := &tele.ReplyMarkup{
-			InlineKeyboard: [][]tele.InlineButton{
-				{btnRestart},
-			},
-		}
 		msg, err := eng.Bot.Send(tele.ChatID(payload.ChatID), initialText, &tele.SendOptions{
-			ParseMode:   tele.ModeMarkdown,
-			ReplyMarkup: inlineMarkup,
+			ParseMode:   tele.ModeHTML,
+			ReplyMarkup: restartJobMarkupBot(job.ID),
 		})
 		if err != nil {
 			logFn("WARN", fmt.Sprintf("Failed to send initial download progress message to Telegram: %v", err))
@@ -930,20 +887,8 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 		}
 	} else {
 		sender := message.NewSender(api)
-		htmlText := mdToHTML(initialText)
-		kbMarkup := &tg.ReplyInlineMarkup{
-			Rows: []tg.KeyboardButtonRow{
-				{
-					Buttons: []tg.KeyboardButtonClass{
-						&tg.KeyboardButtonCallback{
-							Text: "🔄 Restart Job",
-							Data: []byte(fmt.Sprintf("restart_job:%d", job.ID)),
-						},
-					},
-				},
-			},
-		}
-		msg, err := sender.To(peer).Markup(kbMarkup).StyledText(eng.gotdCtx, html.String(nil, htmlText))
+		kbMarkup := restartJobMarkupGotd(job.ID)
+		msg, err := sender.To(peer).Markup(kbMarkup).StyledText(eng.gotdCtx, html.String(nil, initialText))
 		if err == nil {
 			if upd, ok := msg.(*tg.UpdateShortSentMessage); ok {
 				pMsgID = upd.ID
@@ -963,10 +908,12 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 	// 6. Download with progress callback
 	// Use eng.gotdCtx directly — exactly like uploads do. The scheduler's ctx is only
 	// used for job lifecycle tracking, not for the actual Telegram API call.
+	// fileDCID routes the download through the multi-connection pool for the
+	// file's home datacenter, which is what makes the transfer fast.
 	lastUpdate := time.Now()
 	startTime := time.Now()
 
-	err = FastDownloadFile(eng.gotdCtx, eng.gotdClient, fileLocation, safePath, fileSize, func(downloaded, total int64) {
+	err = FastDownloadFile(eng.gotdCtx, eng.gotdClient, fileDCID, fileLocation, safePath, fileSize, func(downloaded, total int64) {
 		percent := int(100 * float64(downloaded) / float64(total))
 		if percent > 100 {
 			percent = 100
@@ -988,58 +935,26 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 			if elapsed > 0 {
 				speed = float64(downloaded) / elapsed / (1024 * 1024) // MB/s
 			}
-			progressText := formatDownloadProgressText(fileName, downloaded, total, percent, speed, elapsed)
+			progressText := formatDownloadProgressHTML(fileName, downloaded, total, percent, speed, elapsed)
 
 			if progressMsg != nil && eng.Bot != nil {
-				btnRestart := tele.InlineButton{
-					Text:   "🔄 Restart Job",
-					Unique: "restart_job",
-					Data:   fmt.Sprintf("%d", job.ID),
-				}
-				inlineMarkup := &tele.ReplyMarkup{
-					InlineKeyboard: [][]tele.InlineButton{
-						{btnRestart},
-					},
-				}
 				_, _ = eng.Bot.Edit(progressMsg, progressText, &tele.SendOptions{
-					ParseMode:   tele.ModeMarkdown,
-					ReplyMarkup: inlineMarkup,
+					ParseMode:   tele.ModeHTML,
+					ReplyMarkup: restartJobMarkupBot(job.ID),
 				})
 			} else if pMsgID != 0 {
-				htmlText := mdToHTML(progressText)
-				kbMarkup := &tg.ReplyInlineMarkup{
-					Rows: []tg.KeyboardButtonRow{
-						{
-							Buttons: []tg.KeyboardButtonClass{
-								&tg.KeyboardButtonCallback{
-									Text: "🔄 Restart Job",
-									Data: []byte(fmt.Sprintf("restart_job:%d", job.ID)),
-								},
-							},
-						},
-					},
-				}
-				_, _ = api.MessagesEditMessage(eng.gotdCtx, &tg.MessagesEditMessageRequest{
-					Peer:        peer,
-					ID:          pMsgID,
-					Message:     htmlText,
-					ReplyMarkup: kbMarkup,
-				})
+				_ = editGotdMessageHTML(eng.gotdCtx, api, peer, pMsgID, progressText, restartJobMarkupGotd(job.ID))
 			}
 		}
 	})
 
 	if err != nil {
 		errMsg := fmt.Sprintf("Failed to download file: %v", err)
-		errorText := formatErrorText(false, fileName, errMsg)
+		errorText := formatErrorHTML(false, fileName, errMsg)
 		if progressMsg != nil && eng.Bot != nil {
-			_, _ = eng.Bot.Edit(progressMsg, errorText, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+			_, _ = eng.Bot.Edit(progressMsg, errorText, &tele.SendOptions{ParseMode: tele.ModeHTML})
 		} else if pMsgID != 0 {
-			_, _ = api.MessagesEditMessage(eng.gotdCtx, &tg.MessagesEditMessageRequest{
-				Peer:    peer,
-				ID:      pMsgID,
-				Message: mdToHTML(errorText),
-			})
+			_ = editGotdMessageHTML(eng.gotdCtx, api, peer, pMsgID, errorText, nil)
 		}
 		return err
 	}
@@ -1086,7 +1001,7 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 		absoluteDownloadURL = fmt.Sprintf("https://ondata.ir%s", downloadPath)
 	}
 
-	successText := formatSuccessText(false, fileName, fileSize, relPath)
+	successText := formatSuccessHTML(false, fileName, fileSize, relPath)
 
 	logFn("INFO", "File downloaded successfully. Updating Telegram message with download link...")
 
@@ -1094,7 +1009,7 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 		kb := &tele.ReplyMarkup{}
 		btn := kb.URL("📥 Download Direct Link", absoluteDownloadURL)
 		kb.Inline(kb.Row(btn))
-		_, _ = eng.Bot.Edit(progressMsg, successText, &tele.SendOptions{ParseMode: tele.ModeMarkdown, ReplyMarkup: kb})
+		_, _ = eng.Bot.Edit(progressMsg, successText, &tele.SendOptions{ParseMode: tele.ModeHTML, ReplyMarkup: kb})
 	} else if pMsgID != 0 {
 		kbMarkup := &tg.ReplyInlineMarkup{
 			Rows: []tg.KeyboardButtonRow{
@@ -1108,13 +1023,7 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 				},
 			},
 		}
-		htmlText := mdToHTML(successText)
-		_, _ = api.MessagesEditMessage(eng.gotdCtx, &tg.MessagesEditMessageRequest{
-			Peer:        peer,
-			ID:          pMsgID,
-			Message:     htmlText,
-			ReplyMarkup: kbMarkup,
-		})
+		_ = editGotdMessageHTML(eng.gotdCtx, api, peer, pMsgID, successText, kbMarkup)
 	}
 
 	return nil
@@ -1136,9 +1045,9 @@ func makeProgressBar(percent int, width int) string {
 	}
 	remaining := width - completed
 
-	// Gradient fill characters for a colorful look
+	// Block characters for a clean, modern progress bar
 	const (
-		fillChar  = "▓"
+		fillChar  = "█"
 		emptyChar = "░"
 		leftCap   = "▐"
 		rightCap  = "▌"
@@ -1170,7 +1079,6 @@ func makeProgressBar(percent int, width int) string {
 		sb.WriteString(emptyChar)
 	}
 	sb.WriteString(rightCap)
-	sb.WriteString(fmt.Sprintf(" `%d%%`", percent))
 	return sb.String()
 }
 
@@ -1201,158 +1109,200 @@ func formatETA(downloaded, total int64, elapsed float64) string {
 	return fmt.Sprintf("%ds", secs)
 }
 
-// formatUploadProgressText builds the premium upload progress message.
-func formatUploadProgressText(fileName string, uploaded, total int64, percent int, speed float64, elapsed float64) string {
+// msgDivider visually separates the header and footer of Telegram status messages.
+const msgDivider = "━━━━━━━━━━━━━━━━━━━━━━"
+
+// escapeHTML escapes user-controlled values (file names, paths, error text)
+// before they are interpolated into Telegram HTML markup. Both the telebot
+// HTML parse mode and gotd's html.String require this to keep such text literal.
+func escapeHTML(s string) string {
+	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
+	return r.Replace(s)
+}
+
+// formatUploadProgressHTML builds the HTML upload progress message.
+func formatUploadProgressHTML(fileName string, uploaded, total int64, percent int, speed float64, elapsed float64) string {
 	eta := formatETA(uploaded, total, elapsed)
 
 	return fmt.Sprintf(
-		"╔══════════════════════╗\n"+
-			"   📤  *UPLOADING FILE*\n"+
-			"╚══════════════════════╝\n\n"+
-			"📄 *File:* `%s`\n"+
-			"📦 *Size:* `%s`\n\n"+
-			"📊 *Progress:*\n"+
-			"%s\n"+
-			"💾 `%s` / `%s`\n\n"+
-			"⚡ *Speed:* `%.2f MB/s`\n"+
-			"⏱ *ETA:* `%s`\n\n"+
-			"━━━━━━━━━━━━━━━━━━━━━━\n"+
-			"🔷 _CleverConnect Engine_",
-		fileName,
+		"📤 <b>UPLOADING FILE</b>\n"+
+			msgDivider+"\n\n"+
+			"📄 <b>File:</b> <code>%s</code>\n"+
+			"📦 <b>Size:</b> <code>%s</code>\n\n"+
+			"%s <b>%d%%</b>\n"+
+			"💾 <code>%s</code> / <code>%s</code>\n\n"+
+			"⚡ <b>Speed:</b> <code>%.2f MB/s</code>\n"+
+			"⏱ <b>ETA:</b> <code>%s</code>\n\n"+
+			msgDivider+"\n"+
+			"🔷 <i>CleverConnect Engine</i>",
+		escapeHTML(fileName),
 		formatFileSize(total),
 		makeProgressBar(percent, 15),
+		percent,
 		formatFileSize(uploaded),
 		formatFileSize(total),
 		speed,
-		eta,
+		escapeHTML(eta),
 	)
 }
 
-// formatDownloadProgressText builds the premium download progress message.
-func formatDownloadProgressText(fileName string, downloaded, total int64, percent int, speed float64, elapsed float64) string {
+// formatDownloadProgressHTML builds the HTML download progress message.
+func formatDownloadProgressHTML(fileName string, downloaded, total int64, percent int, speed float64, elapsed float64) string {
 	eta := formatETA(downloaded, total, elapsed)
 
 	return fmt.Sprintf(
-		"╔══════════════════════╗\n"+
-			"   📥  *DOWNLOADING FILE*\n"+
-			"╚══════════════════════╝\n\n"+
-			"📄 *File:* `%s`\n"+
-			"📦 *Size:* `%s`\n\n"+
-			"📊 *Progress:*\n"+
-			"%s\n"+
-			"💾 `%s` / `%s`\n\n"+
-			"⚡ *Speed:* `%.2f MB/s`\n"+
-			"⏱ *ETA:* `%s`\n\n"+
-			"━━━━━━━━━━━━━━━━━━━━━━\n"+
-			"🔷 _CleverConnect Engine_",
-		fileName,
+		"📥 <b>DOWNLOADING FILE</b>\n"+
+			msgDivider+"\n\n"+
+			"📄 <b>File:</b> <code>%s</code>\n"+
+			"📦 <b>Size:</b> <code>%s</code>\n\n"+
+			"%s <b>%d%%</b>\n"+
+			"💾 <code>%s</code> / <code>%s</code>\n\n"+
+			"⚡ <b>Speed:</b> <code>%.2f MB/s</code>\n"+
+			"⏱ <b>ETA:</b> <code>%s</code>\n\n"+
+			msgDivider+"\n"+
+			"🔷 <i>CleverConnect Engine</i>",
+		escapeHTML(fileName),
 		FormatFileSize(total),
 		makeProgressBar(percent, 15),
+		percent,
 		FormatFileSize(downloaded),
 		FormatFileSize(total),
 		speed,
-		eta,
+		escapeHTML(eta),
 	)
 }
 
-// formatUploadInitialText builds the premium initial upload message.
-func formatUploadInitialText(fileName string, fileSize int64) string {
+// formatUploadInitialHTML builds the HTML initial upload message.
+func formatUploadInitialHTML(fileName string, fileSize int64) string {
 	return fmt.Sprintf(
-		"╔══════════════════════╗\n"+
-			"   📤  *STARTING UPLOAD*\n"+
-			"╚══════════════════════╝\n\n"+
-			"📄 *File:* `%s`\n"+
-			"📦 *Size:* `%s`\n\n"+
-			"📊 *Progress:*\n"+
-			"%s\n\n"+
-			"⏳ _Initializing parallel transfer..._\n\n"+
-			"━━━━━━━━━━━━━━━━━━━━━━\n"+
-			"🔷 _CleverConnect Engine_",
-		fileName,
+		"📤 <b>UPLOADING FILE</b>\n"+
+			msgDivider+"\n\n"+
+			"📄 <b>File:</b> <code>%s</code>\n"+
+			"📦 <b>Size:</b> <code>%s</code>\n\n"+
+			"%s <b>0%%</b>\n\n"+
+			"⏳ <i>Starting parallel transfer…</i>\n\n"+
+			msgDivider+"\n"+
+			"🔷 <i>CleverConnect Engine</i>",
+		escapeHTML(fileName),
 		formatFileSize(fileSize),
 		makeProgressBar(0, 15),
 	)
 }
 
-// formatDownloadInitialText builds the premium initial download message.
-func formatDownloadInitialText(fileName string, fileSize int64) string {
+// formatDownloadInitialHTML builds the HTML initial download message.
+func formatDownloadInitialHTML(fileName string, fileSize int64) string {
 	return fmt.Sprintf(
-		"╔══════════════════════╗\n"+
-			"   📥  *STARTING DOWNLOAD*\n"+
-			"╚══════════════════════╝\n\n"+
-			"📄 *File:* `%s`\n"+
-			"📦 *Size:* `%s`\n\n"+
-			"📊 *Progress:*\n"+
-			"%s\n\n"+
-			"⏳ _Initializing parallel transfer..._\n\n"+
-			"━━━━━━━━━━━━━━━━━━━━━━\n"+
-			"🔷 _CleverConnect Engine_",
-		fileName,
+		"📥 <b>DOWNLOADING FILE</b>\n"+
+			msgDivider+"\n\n"+
+			"📄 <b>File:</b> <code>%s</code>\n"+
+			"📦 <b>Size:</b> <code>%s</code>\n\n"+
+			"%s <b>0%%</b>\n\n"+
+			"⏳ <i>Starting download…</i>\n\n"+
+			msgDivider+"\n"+
+			"🔷 <i>CleverConnect Engine</i>",
+		escapeHTML(fileName),
 		FormatFileSize(fileSize),
 		makeProgressBar(0, 15),
 	)
 }
 
-// formatSuccessText builds the premium download/upload completion message.
-func formatSuccessText(isUpload bool, fileName string, fileSize int64, savedPath string) string {
-	icon := "📥"
+// formatSuccessHTML builds the HTML download/upload completion message.
+func formatSuccessHTML(isUpload bool, fileName string, fileSize int64, savedPath string) string {
 	action := "DOWNLOAD"
 	if isUpload {
-		icon = "📤"
 		action = "UPLOAD"
 	}
 
 	return fmt.Sprintf(
-		"╔══════════════════════╗\n"+
-			"   %s  *%s COMPLETE*\n"+
-			"╚══════════════════════╝\n\n"+
-			"✅ *Status:* `Success`\n\n"+
-			"📄 *File:* `%s`\n"+
-			"📦 *Size:* `%s`\n"+
-			"📁 *Path:* `%s`\n\n"+
-			"%s\n\n"+
-			"━━━━━━━━━━━━━━━━━━━━━━\n"+
-			"🔷 _CleverConnect Engine_",
-		icon, action,
-		fileName,
+		"✅ <b>%s COMPLETE</b>\n"+
+			msgDivider+"\n\n"+
+			"📄 <b>File:</b> <code>%s</code>\n"+
+			"📦 <b>Size:</b> <code>%s</code>\n"+
+			"📁 <b>Path:</b> <code>%s</code>\n\n"+
+			"%s <b>100%%</b>\n\n"+
+			msgDivider+"\n"+
+			"🔷 <i>CleverConnect Engine</i>",
+		action,
+		escapeHTML(fileName),
 		FormatFileSize(fileSize),
-		savedPath,
+		escapeHTML(savedPath),
 		makeProgressBar(100, 15),
 	)
 }
 
-// formatErrorText builds the premium error message.
-func formatErrorText(isUpload bool, fileName string, errMsg string) string {
-	icon := "📥"
+// formatErrorHTML builds the HTML error message.
+func formatErrorHTML(isUpload bool, fileName string, errMsg string) string {
 	action := "DOWNLOAD"
 	if isUpload {
-		icon = "📤"
 		action = "UPLOAD"
 	}
 
 	return fmt.Sprintf(
-		"╔══════════════════════╗\n"+
-			"   %s  *%s FAILED*\n"+
-			"╚══════════════════════╝\n\n"+
-			"❌ *Status:* `Error`\n\n"+
-			"📄 *File:* `%s`\n"+
-			"⚠️ *Reason:*\n`%s`\n\n"+
-			"━━━━━━━━━━━━━━━━━━━━━━\n"+
-			"🔷 _CleverConnect Engine_",
-		icon, action,
-		fileName,
-		errMsg,
+		"❌ <b>%s FAILED</b>\n"+
+			msgDivider+"\n\n"+
+			"📄 <b>File:</b> <code>%s</code>\n"+
+			"⚠️ <b>Reason:</b>\n<code>%s</code>\n\n"+
+			msgDivider+"\n"+
+			"🔷 <i>CleverConnect Engine</i>",
+		action,
+		escapeHTML(fileName),
+		escapeHTML(errMsg),
 	)
+}
+
+// restartJobMarkupBot builds the inline "Restart Job" keyboard for telebot messages.
+func restartJobMarkupBot(jobID uint) *tele.ReplyMarkup {
+	btnRestart := tele.InlineButton{
+		Text:   "🔄 Restart Job",
+		Unique: "restart_job",
+		Data:   fmt.Sprintf("%d", jobID),
+	}
+	return &tele.ReplyMarkup{
+		InlineKeyboard: [][]tele.InlineButton{
+			{btnRestart},
+		},
+	}
+}
+
+// restartJobMarkupGotd builds the inline "Restart Job" keyboard for MTProto messages.
+func restartJobMarkupGotd(jobID uint) *tg.ReplyInlineMarkup {
+	return &tg.ReplyInlineMarkup{
+		Rows: []tg.KeyboardButtonRow{
+			{
+				Buttons: []tg.KeyboardButtonClass{
+					&tg.KeyboardButtonCallback{
+						Text: "🔄 Restart Job",
+						Data: []byte(fmt.Sprintf("restart_job:%d", jobID)),
+					},
+				},
+			},
+		},
+	}
+}
+
+// editGotdMessageHTML edits an existing MTProto message so the given HTML is
+// rendered with real formatting entities. Calling tg.MessagesEditMessage
+// directly with an HTML string would show the tags literally — MTProto has no
+// parse mode, so the markup must be parsed into entities first, which is
+// exactly what the message builder's StyledText does. A nil markup keeps the
+// message's existing keyboard.
+func editGotdMessageHTML(ctx context.Context, api *tg.Client, peer tg.InputPeerClass, msgID int, htmlText string, markup *tg.ReplyInlineMarkup) error {
+	b := &message.NewSender(api).To(peer).Builder
+	if markup != nil {
+		b = b.Markup(markup)
+	}
+	_, err := b.Edit(msgID).StyledText(ctx, html.String(nil, htmlText))
+	return err
 }
 
 type ffprobeOutput struct {
 	Streams []struct {
-		Width      int    `json:"width"`
-		Height     int    `json:"height"`
-		Duration   string `json:"duration"`
-		CodecType  string `json:"codec_type"`
-		CodecName  string `json:"codec_name"`
-		BitRate    string `json:"bit_rate"`
+		Width     int    `json:"width"`
+		Height    int    `json:"height"`
+		Duration  string `json:"duration"`
+		CodecType string `json:"codec_type"`
+		CodecName string `json:"codec_name"`
+		BitRate   string `json:"bit_rate"`
 	} `json:"streams"`
 	Format struct {
 		Duration string            `json:"duration"`
@@ -1432,6 +1382,151 @@ func formatDuration(sec int) string {
 		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
 	}
 	return fmt.Sprintf("%d:%02d", m, s)
+}
+
+// mp4IsFaststart reports whether an MP4 file has its moov atom (the index of
+// all samples) located BEFORE the mdat atom (the media payload). Telegram only
+// streams/plays videos whose moov atom is at the front — when it trails mdat
+// the client must download the whole file first and the inline player refuses
+// to stream it. The check walks the top-level ISO/IEC 14496-12 boxes until it
+// finds moov or mdat.
+func mp4IsFaststart(path string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+
+	var header [8]byte
+	for {
+		if _, err := io.ReadFull(f, header[:]); err != nil {
+			// EOF without seeing either box: not a valid/finalized MP4.
+			return false, fmt.Errorf("moov/mdat box not found: %w", err)
+		}
+
+		size := binary.BigEndian.Uint32(header[0:4])
+		typ := string(header[4:8])
+
+		switch typ {
+		case "moov":
+			return true, nil
+		case "mdat":
+			return false, nil
+		}
+
+		boxLen := int64(size)
+		if size == 1 {
+			// 64-bit "largesize" variant.
+			var ext [8]byte
+			if _, err := io.ReadFull(f, ext[:]); err != nil {
+				return false, err
+			}
+			boxLen = int64(binary.BigEndian.Uint64(ext[:]))
+			if boxLen < 16 {
+				return false, fmt.Errorf("invalid box size %d", boxLen)
+			}
+			boxLen -= 16 // header bytes already consumed
+		} else if size == 0 {
+			// Box extends to EOF — can't skip, and neither box was seen.
+			return false, fmt.Errorf("box %q extends to EOF", typ)
+		}
+
+		if boxLen < 8 {
+			return false, fmt.Errorf("invalid box size %d", boxLen)
+		}
+		if _, err := f.Seek(boxLen-8, io.SeekCurrent); err != nil {
+			return false, err
+		}
+	}
+}
+
+// remuxToFaststartMP4 stream-copies a media file into dstPath as an MP4 with
+// the moov atom at the front. Only the first video and first audio track are
+// kept (subtitles/attachments are dropped — they frequently break stream-copy
+// remuxes). This is a container-level operation: no re-encoding, lossless,
+// and runs at disk speed (a few seconds per GB).
+func remuxToFaststartMP4(srcPath, dstPath string) error {
+	// Independent of the job's context so a scheduler cancel cannot corrupt
+	// the output; bounded so a hung ffmpeg cannot wedge a worker forever.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-y",
+		"-i", srcPath,
+		"-map", "0:v:0", // first video track (required)
+		"-map", "0:a:0?", // first audio track (optional — silent videos)
+		"-c", "copy",
+		"-movflags", "+faststart",
+		"-loglevel", "error",
+		dstPath,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("remux timed out: %w", err)
+		}
+		return fmt.Errorf("ffmpeg remux failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// preparePlayableMedia makes a video instantly playable in Telegram before it
+// is uploaded:
+//   - MP4 (and M4V) whose moov atom trails the media data is remuxed with
+//     +faststart so the inline player can stream it.
+//   - MKV / AVI / FLV / WMV / MOV are remuxed into MP4 when the codecs are
+//     MP4-compatible (H.264/H.265/VP9 + AAC/MP3/AC3 all are), which upgrades
+//     them from "download-only document" to a streamable Telegram video.
+//
+// Every conversion is a lossless stream copy. On any failure (no ffmpeg on
+// the host, incompatible codecs, no disk space, ...) the ORIGINAL file is
+// returned unchanged — upload correctness always beats playability.
+//
+// It returns the path to upload, the display name (extension becomes .mp4
+// when the container changed), and a cleanup func that removes the temp remux
+// (nil when no remux was created).
+func preparePlayableMedia(safePath, fileName string, logFn func(level, message string)) (uploadPath, displayName string, cleanup func()) {
+	log := func(level, format string, args ...any) {
+		if logFn != nil {
+			logFn(level, fmt.Sprintf(format, args...))
+		}
+	}
+
+	ext := strings.ToLower(filepath.Ext(fileName))
+	needsRemux := false
+
+	switch ext {
+	case ".mp4", ".m4v":
+		if fast, err := mp4IsFaststart(safePath); err == nil && !fast {
+			needsRemux = true
+			log("INFO", "MP4 is not faststart (moov atom at end) — remuxing for instant playback")
+		}
+	case ".mkv", ".avi", ".flv", ".wmv", ".mov":
+		needsRemux = true
+		log("INFO", "Remuxing %s container to MP4 so Telegram can stream it", ext)
+	}
+
+	if !needsRemux {
+		return safePath, fileName, nil
+	}
+
+	// Temp file in the same directory (same filesystem, no cross-device copy).
+	tmp, err := os.CreateTemp(filepath.Dir(safePath), ".cc-playable-*.mp4")
+	if err != nil {
+		log("WARN", "Cannot create remux temp file, uploading original: %v", err)
+		return safePath, fileName, nil
+	}
+	tmpPath := tmp.Name()
+	tmp.Close()
+
+	if err := remuxToFaststartMP4(safePath, tmpPath); err != nil {
+		_ = os.Remove(tmpPath)
+		log("WARN", "Remux to playable MP4 failed, uploading original container: %v", err)
+		return safePath, fileName, nil
+	}
+
+	log("INFO", "Playable remux ready: %s", tmpPath)
+	return tmpPath, strings.TrimSuffix(fileName, ext) + ".mp4", func() { _ = os.Remove(tmpPath) }
 }
 
 func formatResolution(w, h int) string {

@@ -596,12 +596,9 @@ func (e *Engine) handleFileBrowseUser(ctx context.Context, entities tg.Entities,
 
 	api := tg.NewClient(e.gotdClient)
 	if messageID != 0 {
-		_, err = api.MessagesEditMessage(ctx, &tg.MessagesEditMessageRequest{
-			Peer:        inputPeer,
-			ID:          messageID,
-			Message:     htmlText,
-			ReplyMarkup: kbMarkup,
-		})
+		// Editing via the raw RPC would render the HTML tags literally (MTProto
+		// has no parse mode); the message builder parses them into entities.
+		_, err = message.NewSender(api).To(inputPeer).Markup(kbMarkup).Edit(messageID).StyledText(ctx, html.String(nil, htmlText))
 	} else {
 		sender := message.NewSender(api)
 		_, err = sender.To(inputPeer).Markup(kbMarkup).StyledText(ctx, html.String(nil, htmlText))
@@ -658,39 +655,91 @@ func (e *Engine) sendFileToChatUser(ctx context.Context, entities tg.Entities, p
 		}
 	}
 
-	inputPeer := getPeerInput(peer, entities)
-	api := tg.NewClient(e.gotdClient)
-	up := uploader.NewUploader(api)
-	
-	fileObj, err := up.FromPath(ctx, safePath)
-	if err != nil {
-		return e.sendUserMessage(ctx, entities, peer, "❌ Failed to upload file: "+err.Error())
+	fileName := filepath.Base(safePath)
+
+	// Make the media instantly playable in Telegram (faststart remux for MP4,
+	// MKV/AVI/... → MP4 container conversion) before uploading. Falls back to
+	// the original file whenever the conversion is impossible.
+	if prepPath, prepName, prepCleanup := preparePlayableMedia(safePath, fileName, nil); prepPath != safePath {
+		safePath = prepPath
+		fileName = prepName
+		defer prepCleanup()
+		if st, statErr := os.Stat(safePath); statErr == nil {
+			info = st
+		}
 	}
 
-	fileName := filepath.Base(safePath)
 	caption := fmt.Sprintf("📁 %s\n📏 %s", filePath, formatFileSize(info.Size()))
 	ext := strings.ToLower(filepath.Ext(fileName))
-	sender := message.NewSender(api)
-	
-	var sendErr error
-	var mediaOption message.MediaOption
 	mimeType := mime.TypeByExtension(ext)
 	if mimeType == "" {
 		mimeType = "application/octet-stream"
 	}
 
+	inputPeer := getPeerInput(peer, entities)
+	api := tg.NewClient(e.gotdClient)
+	up := uploader.NewUploader(api)
+
+	fileObj, err := up.FromPath(ctx, safePath)
+	if err != nil {
+		return e.sendUserMessage(ctx, entities, peer, "❌ Failed to upload file: "+err.Error())
+	}
+
+	sender := message.NewSender(api)
+
+	var sendErr error
+	var mediaOption message.MediaOption
+
 	switch ext {
 	case ".jpg", ".jpeg", ".png", ".gif":
 		mediaOption = message.UploadedPhoto(fileObj, styling.Plain(caption))
-	case ".mp4":
-		doc := message.UploadedDocument(fileObj, styling.Plain(caption))
-		mediaOption = doc.MIME("video/mp4").Filename(fileName).Video().SupportsStreaming()
-	case ".mp3", ".m4a":
-		doc := message.UploadedDocument(fileObj, styling.Plain(caption))
-		mediaOption = doc.MIME(mimeType).Filename(fileName).Audio()
+
+	case ".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".flv", ".wmv":
+		w, h, duration, _, _, _, _, _ := probeMediaMetadata(safePath)
+		mimeStr := "video/mp4"
+		switch ext {
+		case ".mkv":
+			mimeStr = "video/x-matroska"
+		case ".webm":
+			mimeStr = "video/webm"
+		case ".mov":
+			mimeStr = "video/quicktime"
+		case ".avi":
+			mimeStr = "video/x-msvideo"
+		}
+		videoBuilder := message.UploadedDocument(fileObj, styling.Plain(caption)).MIME(mimeStr).Filename(fileName).Video()
+		if w > 0 && h > 0 {
+			videoBuilder = videoBuilder.Resolution(w, h)
+		}
+		if duration > 0 {
+			videoBuilder = videoBuilder.DurationSeconds(duration)
+		}
+		mediaOption = videoBuilder.SupportsStreaming()
+
+	case ".mp3", ".m4a", ".flac", ".wav", ".aac", ".wma":
+		_, _, duration, _, _, _, title, artist := probeMediaMetadata(safePath)
+		audioBuilder := message.UploadedDocument(fileObj, styling.Plain(caption)).MIME(mimeType).Filename(fileName).Audio()
+		if duration > 0 {
+			audioBuilder = audioBuilder.DurationSeconds(duration)
+		}
+		if title != "" {
+			audioBuilder = audioBuilder.Title(title)
+		} else {
+			audioBuilder = audioBuilder.Title(strings.TrimSuffix(fileName, filepath.Ext(fileName)))
+		}
+		if artist != "" {
+			audioBuilder = audioBuilder.Performer(artist)
+		}
+		mediaOption = audioBuilder
+
 	case ".ogg", ".opus":
-		doc := message.UploadedDocument(fileObj, styling.Plain(caption))
-		mediaOption = doc.MIME(mimeType).Filename(fileName).Audio().Voice()
+		_, _, duration, _, _, _, _, _ := probeMediaMetadata(safePath)
+		voiceBuilder := message.UploadedDocument(fileObj, styling.Plain(caption)).MIME(mimeType).Filename(fileName).Audio().Voice()
+		if duration > 0 {
+			voiceBuilder = voiceBuilder.DurationSeconds(duration)
+		}
+		mediaOption = voiceBuilder
+
 	default:
 		doc := message.UploadedDocument(fileObj, styling.Plain(caption))
 		doc.MIME(mimeType).Filename(fileName)
@@ -774,12 +823,12 @@ func (e *Engine) handleUserMessage(ctx context.Context, entities tg.Entities, up
 	switch {
 	case strings.HasPrefix(text, "/start"):
 		e.commandsProcessed.Add(1)
-		
+
 		var sub models.TelegramSubscriber
 		if err := db.DB.Where("chat_id = ?", senderID).First(&sub).Error; err != nil {
 			sub = models.TelegramSubscriber{
-				ChatID:    senderID,
-				Active:    true,
+				ChatID: senderID,
+				Active: true,
 			}
 			if p, ok := m.PeerID.(*tg.PeerUser); ok {
 				if user, ok := entities.Users[p.UserID]; ok {
@@ -856,7 +905,7 @@ func (e *Engine) handleUserMessage(ctx context.Context, entities tg.Entities, up
 	case strings.HasPrefix(text, "/status"):
 		e.commandsProcessed.Add(1)
 		uptime := time.Since(e.startedAt)
-		
+
 		e.mu.RLock()
 		meUsername := e.meUsername
 		e.mu.RUnlock()
@@ -879,7 +928,7 @@ func (e *Engine) handleUserMessage(ctx context.Context, entities tg.Entities, up
 			e.errors.Load(),
 			meUsername,
 		)
-		
+
 		var activeDownloads []models.LeechJob
 		if err := db.DB.Where("status = ?", "downloading").Find(&activeDownloads).Error; err == nil && len(activeDownloads) > 0 {
 			stats += "\n\n📥 *Active Downloads:*"
