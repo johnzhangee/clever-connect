@@ -6,7 +6,7 @@ import {
 	FiImage, FiVideo, FiZoomIn, FiZoomOut, FiRotateCw, FiX, FiCheck,
 	FiChevronRight, FiChevronDown, FiScissors, FiCopy, FiClipboard, FiInfo, FiArchive, FiShare2,
 	FiPlay, FiPause, FiMaximize2, FiChevronLeft, FiExternalLink,
-	FiRotateCcw, FiVolume2, FiVolumeX, FiTv, FiMinimize2, FiEye, FiSend, FiSearch, FiCloud
+	FiRotateCcw, FiVolume2, FiVolumeX, FiTv, FiMinimize2, FiEye, FiSend, FiSearch, FiCloud, FiUploadCloud
 } from 'react-icons/fi';
 import Editor from '@monaco-editor/react';
 import { showGlobalAlert, showGlobalConfirm, showGlobalPrompt } from '../store/dialogStore';
@@ -742,6 +742,15 @@ export const FilesPage: React.FC = () => {
 	const [newFolderName, setNewFolderName] = useState<string>('');
 	const [creatingFolder, setCreatingFolder] = useState<boolean>(false);
 
+	// Cloud Storage (rclone) Upload Modal
+	const [showCloudUploadModal, setShowCloudUploadModal] = useState<boolean>(false);
+	const [cloudRemotes, setCloudRemotes] = useState<{ id: number; name: string; type: string }[]>([]);
+	const [cloudRemoteId, setCloudRemoteId] = useState<string>('');
+	const [cloudDestDir, setCloudDestDir] = useState<string>('');
+	const [cloudKeepStructure, setCloudKeepStructure] = useState<boolean>(true);
+	const [cloudNeedLink, setCloudNeedLink] = useState<boolean>(false);
+	const [cloudUploading, setCloudUploading] = useState<boolean>(false);
+
 	// Archive Modal
 	const [showArchiveModal, setShowArchiveModal] = useState<boolean>(false);
 	const [archiveName, setArchiveName] = useState<string>('archive.zip');
@@ -1292,6 +1301,68 @@ export const FilesPage: React.FC = () => {
 			}
 		} catch (err: any) {
 			showGlobalAlert(`Error moving to S3: ${err.message}`, { title: 'Error', variant: 'error' });
+		}
+	};
+
+	// Open the "Upload to Cloud" modal: loads the admin's enabled rclone remotes.
+	const openCloudUploadModal = async () => {
+		if (selectedItems.length === 0) return;
+		try {
+			const res = await fetch('/api/rclone/remotes', {
+				headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` }
+			});
+			if (res.ok) {
+				const data = await res.json();
+				const enabled = (data.remotes || []).filter((r: any) => r.enabled);
+				if (enabled.length === 0) {
+					showGlobalAlert('No enabled cloud remotes — configure one on the Cloud Storage page first.', { title: 'Cloud Upload', variant: 'warning' });
+					return;
+				}
+				setCloudRemotes(enabled);
+				setCloudRemoteId(String(enabled[0].id));
+				setCloudDestDir('');
+				setCloudKeepStructure(true);
+				setCloudNeedLink(false);
+				setShowCloudUploadModal(true);
+			} else {
+				showGlobalAlert('Cloud storage is unavailable on this server.', { title: 'Cloud Upload', variant: 'warning' });
+			}
+		} catch (err: any) {
+			showGlobalAlert(`Error loading remotes: ${err.message}`, { title: 'Cloud Upload', variant: 'error' });
+		}
+	};
+
+	// Submit the selected items as an rclone cloud upload scheduler job.
+	const handleCloudUpload = async (e: React.FormEvent) => {
+		e.preventDefault();
+		if (selectedItems.length === 0 || !cloudRemoteId) return;
+		const paths = selectedItems.map(name => currentPath === '/' ? `/${name}` : `${currentPath}/${name}`);
+		setCloudUploading(true);
+		try {
+			const res = await fetch('/api/rclone/upload', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+				body: JSON.stringify({
+					paths,
+					remote_id: parseInt(cloudRemoteId, 10),
+					dest_dir: cloudDestDir.trim(),
+					keep_structure: cloudKeepStructure,
+					require_public_link: cloudNeedLink,
+				})
+			});
+			if (res.ok) {
+				const data = await res.json();
+				showGlobalAlert(`Cloud upload queued: ${data.upload_count} item(s), job #${data.job_id}. Track progress on the Cloud Storage page.`, { title: 'Upload Queued', variant: 'success' });
+				setShowCloudUploadModal(false);
+				setSelectedItems([]);
+			} else {
+				const errData = await res.json();
+				showGlobalAlert(`Cloud upload failed: ${errData.error}`, { title: 'Upload Failed', variant: 'error' });
+			}
+		} catch (err: any) {
+			showGlobalAlert(`Error uploading to cloud: ${err.message}`, { title: 'Error', variant: 'error' });
+		} finally {
+			setCloudUploading(false);
 		}
 	};
 
@@ -2010,6 +2081,31 @@ export const FilesPage: React.FC = () => {
 								<FiCloud size={14} /> Move to S3
 							</button>
 						)}
+
+						{/* Upload to Cloud Button (rclone universal storage) */}
+						<button
+							type="button"
+							disabled={selectedItems.length === 0}
+							onClick={openCloudUploadModal}
+							style={{
+								padding: '6px 10px',
+								borderRadius: 6,
+								border: '1px solid var(--color-brand-border)',
+								background: selectedItems.length > 0 ? 'rgba(99,102,241,0.1)' : 'transparent',
+								color: selectedItems.length > 0 ? '#6366f1' : 'var(--color-brand-muted)',
+								cursor: selectedItems.length > 0 ? 'pointer' : 'not-allowed',
+								opacity: selectedItems.length > 0 ? 1 : 0.5,
+								display: 'flex',
+								alignItems: 'center',
+								gap: 4,
+								fontSize: 12,
+								fontWeight: 600,
+								transition: 'all 0.15s'
+							}}
+							title="Upload selected items to a configured cloud remote"
+						>
+							<FiUploadCloud size={14} /> Upload to Cloud
+						</button>
 
 						{/* Share Link / Download Button */}
 							<button 
@@ -2760,6 +2856,60 @@ export const FilesPage: React.FC = () => {
 					</div>
 				</div>
 			)}
+
+			{/* Upload to Cloud Modal (rclone) */}
+			{showCloudUploadModal && (
+				<div style={{ position: 'fixed', left: 0, top: 0, width: '100vw', height: '100vh', background: 'rgba(0,0,0,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 999 }}>
+					<div className="g-card animate-zoom-in" style={{ width: 420, padding: 22, boxShadow: '0 20px 40px rgba(0,0,0,0.2)' }}>
+						<div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+							<h3 style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-brand-heading)', margin: 0 }}>Upload to Cloud</h3>
+							<button onClick={() => setShowCloudUploadModal(false)} style={{ border: 'none', background: 'none', cursor: 'pointer', padding: 0 }}><FiX size={16} /></button>
+						</div>
+						<form onSubmit={handleCloudUpload}>
+							<div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 14 }}>
+								<div>
+									<label style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-brand-muted)', textTransform: 'uppercase', display: 'block', marginBottom: 4 }}>Remote</label>
+									<select 
+										value={cloudRemoteId} 
+										onChange={(e) => setCloudRemoteId(e.target.value)}
+										style={{ width: '100%', padding: '8px 10px', borderRadius: 6, border: '1px solid var(--color-brand-border)', background: 'var(--color-brand-bg)', color: 'var(--color-brand-heading)', fontSize: 13 }}
+									>
+										{cloudRemotes.map((r) => (
+<option key={r.id} value={String(r.id)}>{r.name} ({r.type})</option>
+										))}
+									</select>
+								</div>
+								<div>
+									<label style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-brand-muted)', textTransform: 'uppercase', display: 'block', marginBottom: 4 }}>Destination directory (optional)</label>
+									<input 
+										type="text" 
+										value={cloudDestDir}
+										onChange={(e) => setCloudDestDir(e.target.value)}
+										placeholder="e.g. uploads/2026"
+										style={{ width: '100%', padding: '8px 10px', borderRadius: 6, border: '1px solid var(--color-brand-border)', background: 'var(--color-brand-bg)', color: 'var(--color-brand-heading)', fontSize: 13 }}
+									/>
+									<div style={{ fontSize: 10.5, color: 'var(--color-brand-muted)', marginTop: 3 }}>Added under the remote's root prefix.</div>
+</div>
+<label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--color-brand-text)', cursor: 'pointer' }}>
+<input type="checkbox" checked={cloudKeepStructure} onChange={(e) => setCloudKeepStructure(e.target.checked)} />
+Keep folder structure (mirror the local path)
+</label>
+<label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--color-brand-text)', cursor: 'pointer' }}>
+<input type="checkbox" checked={cloudNeedLink} onChange={(e) => setCloudNeedLink(e.target.checked)} />
+Request public share links
+</label>
+<div style={{ fontSize: 11, color: 'var(--color-brand-muted)' }}>
+{selectedItems.length} selected item(s) will be uploaded through the job scheduler.
+</div>
+</div>
+<div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+<button type="button" className="btn" onClick={() => setShowCloudUploadModal(false)}>Cancel</button>
+<button type="submit" className="btn btn--primary" disabled={cloudUploading}>{cloudUploading ? 'Queuing...' : 'Upload to Cloud'}</button>
+</div>
+</form>
+</div>
+</div>
+)}
 
 			{/* Archive Modal */}
 			{showArchiveModal && (

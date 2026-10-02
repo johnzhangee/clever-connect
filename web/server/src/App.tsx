@@ -15,6 +15,7 @@ const PlayerPage = lazy(() => import('./pages/PlayerPage').then(m => ({ default:
 const TorrentPage = lazy(() => import('./pages/TorrentPage').then(m => ({ default: m.TorrentPage })));
 const YouTubePage = lazy(() => import('./pages/YouTubePage').then(m => ({ default: m.YouTubePage })));
 const SpotifyPage = lazy(() => import('./pages/SpotifyPage').then(m => ({ default: m.SpotifyPage })));
+const CloudStoragePage = lazy(() => import('./pages/CloudStoragePage').then(m => ({ default: m.CloudStoragePage })));
 const TelegramSettingsPage = lazy(() => import('./pages/TelegramSettingsPage').then(m => ({ default: m.TelegramSettingsPage })));
 const JobSchedulerPage = lazy(() => import('./pages/JobSchedulerPage').then(m => ({ default: m.JobSchedulerPage })));
 const SoroushPage = lazy(() => import('./pages/SoroushPage').then(m => ({ default: m.SoroushPage })));
@@ -52,6 +53,7 @@ const ProtectedLayout: React.FC = () => {
     'fw-logs': ['System Logs', 'Diagnostics'],
     'ehco-tunnel': ['Protocol', 'Ehco'],
     files: ['Storage', 'Files Explorer'],
+    'cloud-storage': ['Storage', 'Cloud Storage'],
     leech: ['Storage', 'Remote Leech Manager'],
     torrent: ['Storage', 'Torrent Client'],
     youtube: ['Storage', 'YouTube Downloader'],
@@ -126,6 +128,7 @@ const router = createBrowserRouter([
       { path: 'fw-logs', element: <LogsPage /> },
       { path: 'ehco-tunnel', element: <EhcoServerPage /> },
       { path: 'files', element: <FilesPage /> },
+      { path: 'cloud-storage', element: <CloudStoragePage /> },
       { path: 'leech', element: <LeechPage /> },
       { path: 'torrent', element: <TorrentPage /> },
       { path: 'youtube', element: <YouTubePage /> },

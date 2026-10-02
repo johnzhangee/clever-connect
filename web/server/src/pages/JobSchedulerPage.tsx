@@ -35,6 +35,7 @@ interface Stats {
 const JOB_TYPES = [
   { value: 'file_compress',   label: 'File Compression',   cat: 'files'   },
   { value: 'file_decompress', label: 'File Decompression', cat: 'files'   },
+  { value: 'rclone_upload',   label: 'Cloud Upload',       cat: 'files'   },
   { value: 'system_cleanup',  label: 'System Cleanup',     cat: 'system'  },
   { value: 'db_backup',       label: 'Database Backup',    cat: 'system'  },
   { value: 'custom_task',     label: 'Custom Task',        cat: 'general' },

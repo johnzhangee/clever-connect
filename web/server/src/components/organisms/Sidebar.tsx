@@ -32,6 +32,7 @@ const navItems = [
     id: 'files-section', label: 'Files', icon: FiFolder,
     children: [
       { id: 'files', label: 'File manager' },
+      { id: 'cloud-storage', label: 'Cloud storage' },
       { id: 'leech', label: 'Leech manager' },
       { id: 'torrent', label: 'Torrent client' },
       { id: 'youtube', label: 'YouTube downloader' },
