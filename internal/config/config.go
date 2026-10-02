@@ -1,6 +1,8 @@
 package config
 
 import (
+	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,12 +23,17 @@ type Config struct {
 	// SQLite (Client mode)
 	SQLitePath string
 
-	// MySQL (Server mode)
-	MySQLUser     string
-	MySQLPassword string
-	MySQLHost     string
-	MySQLPort     string
-	MySQLDBName   string
+	// PostgreSQL (Server mode)
+	PostgresUser     string
+	PostgresPassword string
+	PostgresHost     string
+	PostgresPort     string
+	PostgresDBName   string
+
+	// PostgresURI is the full connection URI/DSN handed to the GORM driver.
+	// It is taken from POSTGRESQL_ADDON_URI (Clever Cloud PostgreSQL addon)
+	// or built from the individual POSTGRES_* variables.
+	PostgresURI string
 
 	// Seed Admin
 	AdminUsername string
@@ -113,11 +120,11 @@ func LoadConfig() *Config {
 		BondingFrameSize:   getEnvInt("BONDING_FRAME_SIZE", 4096),
 		ServerAuthToken:     serverAuthToken,
 		SQLitePath:          getEnv("SQLITE_DB_PATH", resolveDefaultClientDBPath()),
-		MySQLUser:           getEnv("MYSQL_USER", "root"),
-		MySQLPassword:       os.Getenv("MYSQL_PASSWORD"),
-		MySQLHost:           getEnv("MYSQL_HOST", "127.0.0.1"),
-		MySQLPort:           getEnv("MYSQL_PORT", "3306"),
-		MySQLDBName:         getEnv("MYSQL_DB_NAME", "clever_connect_server"),
+		PostgresUser:        getEnv("POSTGRES_USER", "postgres"),
+		PostgresPassword:    os.Getenv("POSTGRES_PASSWORD"),
+		PostgresHost:        getEnv("POSTGRES_HOST", "127.0.0.1"),
+		PostgresPort:        getEnv("POSTGRES_PORT", "5432"),
+		PostgresDBName:      getEnv("POSTGRES_DB_NAME", "clever_connect_server"),
 		AdminUsername:       getEnv("ADMIN_USERNAME", "salman"),
 		AdminPassword:       getEnv("ADMIN_PASSWORD", "136517"),
 
@@ -138,43 +145,44 @@ func LoadConfig() *Config {
 	// S3 is considered enabled only when the full credential triple is present
 	cfg.S3Enabled = cfg.S3Host != "" && cfg.S3KeyID != "" && cfg.S3KeySecret != ""
 
-	// Automatic parsing of database URIs (e.g. from Clever Cloud MySQL addon)
-	mysqlURI := os.Getenv("MYSQL_ADDON_URI")
-	if mysqlURI == "" {
-		mysqlURI = os.Getenv("DATABASE_URL")
+	// Automatic parsing of database URIs (e.g. from Clever Cloud PostgreSQL
+	// addon). The full URI is handed to the driver verbatim; the individual
+	// fields are only parsed for logging purposes.
+	pgURI := os.Getenv("POSTGRESQL_ADDON_URI")
+	if pgURI == "" {
+		pgURI = os.Getenv("POSTGRESQL_URI")
 	}
-	if mysqlURI != "" && strings.HasPrefix(mysqlURI, "mysql://") {
-		uri := strings.TrimPrefix(mysqlURI, "mysql://")
-		parts := strings.SplitN(uri, "@", 2)
-		if len(parts) == 2 {
-			userPass := parts[0]
-			hostPortDb := parts[1]
-
-			up := strings.SplitN(userPass, ":", 2)
-			if len(up) == 2 {
-				cfg.MySQLUser = up[0]
-				cfg.MySQLPassword = up[1]
+	if pgURI == "" {
+		pgURI = os.Getenv("DATABASE_URL")
+	}
+	if pgURI != "" && (strings.HasPrefix(pgURI, "postgres://") || strings.HasPrefix(pgURI, "postgresql://")) {
+		if u, err := url.Parse(pgURI); err == nil {
+			if u.User != nil {
+				cfg.PostgresUser = u.User.Username()
+				if pw, ok := u.User.Password(); ok {
+					cfg.PostgresPassword = pw
+				}
 			}
-
-			hpdb := strings.SplitN(hostPortDb, "/", 2)
-			if len(hpdb) == 2 {
-				hostPort := hpdb[0]
-				cfg.MySQLDBName = hpdb[1]
-
-				if idx := strings.Index(cfg.MySQLDBName, "?"); idx > 0 {
-					cfg.MySQLDBName = cfg.MySQLDBName[:idx]
-				}
-
-				hp := strings.SplitN(hostPort, ":", 2)
-				if len(hp) == 2 {
-					cfg.MySQLHost = hp[0]
-					cfg.MySQLPort = hp[1]
-				} else {
-					cfg.MySQLHost = hostPort
-					cfg.MySQLPort = "3306"
-				}
+			if u.Hostname() != "" {
+				cfg.PostgresHost = u.Hostname()
+			}
+			if u.Port() != "" {
+				cfg.PostgresPort = u.Port()
+			}
+			if db := strings.TrimPrefix(u.Path, "/"); db != "" {
+				cfg.PostgresDBName = db
 			}
 		}
+		cfg.PostgresURI = pgURI
+	} else {
+		// Build a keyword/value DSN from the individual variables.
+		cfg.PostgresURI = fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=prefer",
+			cfg.PostgresHost,
+			cfg.PostgresPort,
+			cfg.PostgresUser,
+			cfg.PostgresPassword,
+			cfg.PostgresDBName,
+		)
 	}
 
 	return cfg

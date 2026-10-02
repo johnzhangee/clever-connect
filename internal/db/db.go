@@ -3,7 +3,6 @@ package db
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -15,7 +14,7 @@ import (
 	sqlite "clever-connect/internal/db/sqlite"
 
 	"golang.org/x/crypto/bcrypt"
-	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 )
@@ -54,26 +53,18 @@ func InitDB(cfg *config.Config) *gorm.DB {
 		DB.Exec("PRAGMA busy_timeout=10000;")
 		DB.Exec("PRAGMA synchronous=NORMAL;")
 	} else {
-		// MySQL Mode (Server panel)
-		dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True&loc=Local",
-			cfg.MySQLUser,
-			cfg.MySQLPassword,
-			cfg.MySQLHost,
-			cfg.MySQLPort,
-			cfg.MySQLDBName,
-		)
-		logger.Info("DB", "Connecting to MySQL database",
-			"user", cfg.MySQLUser,
-			"host", cfg.MySQLHost,
-			"port", cfg.MySQLPort,
-			"database", cfg.MySQLDBName,
+		// PostgreSQL Mode (Server panel)
+		logger.Info("DB", "Connecting to PostgreSQL database",
+			"host", cfg.PostgresHost,
+			"port", cfg.PostgresPort,
+			"database", cfg.PostgresDBName,
 		)
 
-		DB, err = gorm.Open(mysql.Open(dsn), gormCfg)
+		DB, err = gorm.Open(postgres.Open(cfg.PostgresURI), gormCfg)
 		if err != nil {
 			// Elegant fallback to SQLite for easy development/review!
 			fallbackPath := "data/server_fallback.db"
-			logger.Warn("DB", "Failed to connect to MySQL — activating SQLite fallback",
+			logger.Warn("DB", "Failed to connect to PostgreSQL — activating SQLite fallback",
 				"error", err,
 				"fallback", fallbackPath,
 			)
@@ -95,17 +86,17 @@ func InitDB(cfg *config.Config) *gorm.DB {
 			DB.Exec("PRAGMA busy_timeout=10000;")
 			DB.Exec("PRAGMA synchronous=NORMAL;")
 		} else {
-			logger.Info("DB", "MySQL connection established",
-				"host", cfg.MySQLHost,
-				"database", cfg.MySQLDBName,
+			logger.Info("DB", "PostgreSQL connection established",
+				"host", cfg.PostgresHost,
+				"database", cfg.PostgresDBName,
 			)
 			if sqlDB, err := DB.DB(); err == nil {
-				// Clever Cloud MySQL addon enforces a hard limit of 5 concurrent
-				// connections per user. We cap at 4 to leave one slot free for
-				// admin/monitoring tools, and keep idle connections low so they
-				// are promptly returned and reused rather than sitting open.
-				sqlDB.SetMaxOpenConns(4)
-				sqlDB.SetMaxIdleConns(2)
+				// Managed PostgreSQL plans cap concurrent connections per plan
+				// size. We keep the pool modest, and idle connections low so
+				// they are promptly returned and reused rather than sitting
+				// open and exhausting the plan's connection budget.
+				sqlDB.SetMaxOpenConns(8)
+				sqlDB.SetMaxIdleConns(4)
 				sqlDB.SetConnMaxLifetime(5 * time.Minute)
 				sqlDB.SetConnMaxIdleTime(2 * time.Minute)
 			}
@@ -114,11 +105,7 @@ func InitDB(cfg *config.Config) *gorm.DB {
 
 	// Auto Migration
 	logger.Info("DB", "Executing automatic database schema migrations")
-	migrateDB := DB
-	if DB.Dialector.Name() == "mysql" {
-		migrateDB = DB.Set("gorm:table_options", "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci")
-	}
-	if err := migrateDB.AutoMigrate(
+	if err := DB.AutoMigrate(
 		&models.User{},
 		&models.ClientSession{},
 		&models.EhcoServerConfig{},
@@ -174,24 +161,13 @@ func InitDB(cfg *config.Config) *gorm.DB {
 		logger.Fatal("DB", "Auto migration failed", "error", err)
 	}
 
-	// Ensure the table collation is converted to utf8mb4 to support emoji/symbols in welcome messages
-	if DB.Dialector.Name() == "mysql" {
-		DB.Exec("ALTER TABLE `telegram_configs` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
-		DB.Exec("ALTER TABLE `soroush_tunnel_configs` MODIFY COLUMN `call_access_hash` VARCHAR(1024) NULL")
-
-		// Fix legacy api_token column in cloudflare_accounts if it exists
-		var columnExists int64
-		DB.Raw("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'cloudflare_accounts' AND COLUMN_NAME = 'api_token'", cfg.MySQLDBName).Scan(&columnExists)
-		if columnExists > 0 {
-			logger.Info("DB", "Migrating legacy api_token column in cloudflare_accounts to be nullable")
-			DB.Exec("ALTER TABLE `cloudflare_accounts` MODIFY COLUMN `api_token` TEXT NULL")
-		}
-	}
+	// Note: PostgreSQL is unicode-native (no utf8mb4 collation fixups needed,
+	// unlike the previous MySQL setup). Column types are managed by AutoMigrate.
 	logger.Info("DB", "Schema migrations completed successfully")
 
 	if cfg.AppMode == "client" {
 		logger.Info("DB", "Executing client-only database schema migrations")
-		if err := migrateDB.AutoMigrate(&models.V2RayScannerConfig{}); err != nil {
+		if err := DB.AutoMigrate(&models.V2RayScannerConfig{}); err != nil {
 			logger.Fatal("DB", "Client scanner migration failed", "error", err)
 		}
 
