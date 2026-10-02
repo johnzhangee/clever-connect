@@ -93,6 +93,19 @@ func IsRunning() bool {
 	return e != nil && e.running.Load()
 }
 
+// UserSessionPath returns the filesystem path of the MTProto user session file.
+func UserSessionPath() string {
+	return filepath.Join("./data/manager", ".telegram", "session.json")
+}
+
+// HasUserSession reports whether a verified MTProto user session file exists.
+// The engine cannot start in user mode until this file has been created by the
+// interactive verification flow (phone number + login code [+ 2FA password]).
+func HasUserSession() bool {
+	_, err := os.Stat(UserSessionPath())
+	return err == nil
+}
+
 // StartEngine boots the Telegram bot using the config stored in the database.
 // It spawns runtime.NumCPU() worker goroutines for parallel message processing.
 func StartEngine(cfg *models.TelegramConfig) error {
@@ -135,11 +148,11 @@ func StartEngine(cfg *models.TelegramConfig) error {
 	
 	var sessionPath string
 	if cfg.AuthType == "user" {
-		sessionPath = filepath.Join(sessionDir, "session.json")
+		sessionPath = UserSessionPath()
 		// Check if session file exists
 		if _, err := os.Stat(sessionPath); os.IsNotExist(err) {
 			cancel()
-			return fmt.Errorf("user session file does not exist. Please authenticate first via admin panel")
+			return fmt.Errorf("MTProto user session not found — complete User Account Verification (phone number + code) in Telegram settings first")
 		}
 	} else {
 		sessionPath = filepath.Join(sessionDir, "session_bot.json")

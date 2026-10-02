@@ -129,8 +129,9 @@ func (h *TelegramHandler) GetConfig(c *gin.Context) {
 	var cfg models.TelegramConfig
 	if err := db.DB.First(&cfg).Error; err != nil {
 		c.JSON(http.StatusOK, gin.H{
-			"config":  models.TelegramConfig{PollingInterval: 10, MaxFileSize: 2000, EnableFileSharing: true, EnableNotifications: true},
-			"running": false,
+			"config":              models.TelegramConfig{PollingInterval: 10, MaxFileSize: 2000, EnableFileSharing: true, EnableNotifications: true},
+			"running":             false,
+			"user_session_exists": telegram.HasUserSession(),
 		})
 		return
 	}
@@ -150,10 +151,11 @@ func (h *TelegramHandler) GetConfig(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"config":       cfg,
-		"masked_token": maskedToken,
-		"running":      running,
-		"stats":        stats,
+		"config":              cfg,
+		"masked_token":        maskedToken,
+		"running":             running,
+		"stats":               stats,
+		"user_session_exists": telegram.HasUserSession(),
 	})
 }
 
@@ -283,6 +285,17 @@ func (h *TelegramHandler) StartBot(c *gin.Context) {
 
 	if cfg.AuthType == "bot" && cfg.BotToken == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "No bot token configured. Save a configuration first."})
+		return
+	}
+
+	// User mode requires a verified MTProto session file. Give the client a
+	// machine-readable code so the UI can guide the user to the verification
+	// flow instead of surfacing a cryptic engine error.
+	if cfg.AuthType == "user" && !telegram.HasUserSession() {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "User account is not verified yet. Complete User Account Verification (phone number → code) in Telegram settings first — the engine will start automatically after verification.",
+			"code":  "user_auth_required",
+		})
 		return
 	}
 

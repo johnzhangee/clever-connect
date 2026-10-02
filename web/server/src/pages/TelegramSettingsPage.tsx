@@ -76,6 +76,7 @@ export const TelegramSettingsPage: React.FC = () => {
   const [password, setPassword] = useState('');
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState('');
+  const [sessionExists, setSessionExists] = useState(false);
 
   const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' };
 
@@ -148,6 +149,7 @@ export const TelegramSettingsPage: React.FC = () => {
         if (loadedConfig.auth_type === 'user' && data.running) {
           setAuthStep('success');
         }
+        setSessionExists(!!data.user_session_exists);
       }
       setRunning(!!data.running);
       if (data.stats) setStats(data.stats);
@@ -223,6 +225,12 @@ export const TelegramSettingsPage: React.FC = () => {
       if (data.status === 'success') {
         setRunning(!running);
         await fetchConfig();
+      } else if (!running && data.code === 'user_auth_required') {
+        // Guide the user into the verification flow instead of a raw error
+        setAuthStep('phone');
+        setAuthError('Start aborted — this user account has no verified session yet. Enter your phone number below and complete verification; the engine will start automatically afterwards.');
+        setSaveMsg('');
+        document.getElementById('telegram-user-verification')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
       } else {
         setSaveMsg(`❌ ${data.error}`);
       }
@@ -449,14 +457,32 @@ export const TelegramSettingsPage: React.FC = () => {
               </div>
 
               {/* Interactive User Verification Card */}
-              <div className="g-card animate-slide-in">
+              <div id="telegram-user-verification" className="g-card animate-slide-in">
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
                   <FiPhone style={{ color: 'var(--color-brand)', fontSize: 18 }} />
                   <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--color-brand-heading)' }}>User Account Verification</span>
+                  <span style={{
+                    marginLeft: 'auto',
+                    fontSize: 10,
+                    fontWeight: 700,
+                    padding: '3px 10px',
+                    borderRadius: 999,
+                    whiteSpace: 'nowrap',
+                    background: sessionExists ? 'rgba(16,185,129,0.1)' : 'rgba(245,158,11,0.1)',
+                    color: sessionExists ? '#10b981' : '#f59e0b',
+                    border: `1px solid ${sessionExists ? 'rgba(16,185,129,0.3)' : 'rgba(245,158,11,0.3)'}`,
+                  }}>
+                    {sessionExists ? '✓ Session saved' : '⚠ Verification required'}
+                  </span>
                 </div>
 
                 {authStep === 'phone' && (
                   <div>
+                    {sessionExists && !running && (
+                      <div style={{ marginBottom: 12, padding: '10px 14px', borderRadius: 8, fontSize: 12, background: 'rgba(16,185,129,0.08)', border: '1px solid rgba(16,185,129,0.3)', color: '#10b981' }}>
+                        ℹ️ A verified MTProto session is saved — you can start the engine directly, or re-verify below if the login expired.
+                      </div>
+                    )}
                     <label style={labelStyle}>Phone Number</label>
                     <div style={{ display: 'flex', gap: 8 }}>
                       <input
@@ -771,9 +797,9 @@ export const TelegramSettingsPage: React.FC = () => {
               <ol style={{ margin: 0, paddingLeft: 18 }}>
                 <li>Create a Telegram App on <strong>my.telegram.org</strong></li>
                 <li>Enter App API ID and App API Hash</li>
-                <li>Enter your phone number and request verification code</li>
-                <li>Verify code and 2FA password to save session</li>
-                <li>Add your Telegram ID as admin and click <strong>Start</strong></li>
+                <li><strong>Required before Start:</strong> enter your phone number and request the verification code</li>
+                <li>Verify the code (and 2FA password) — the session is saved and the engine starts automatically</li>
+                <li>Add your Telegram ID as admin — <strong>Start</strong> is only needed again after a Stop</li>
               </ol>
             )}
           </div>
