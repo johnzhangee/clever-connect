@@ -167,6 +167,9 @@ func InitDB(cfg *config.Config) *gorm.DB {
 		&models.TrustTunnelConfig{},
 		&models.TrustTunnelUser{},
 		&models.TrustTunnelFirewallRule{},
+		&models.RcloneRemote{},
+		&models.RcloneUpload{},
+		&models.RcloneSystem{},
 	); err != nil {
 		logger.Fatal("DB", "Auto migration failed", "error", err)
 	}

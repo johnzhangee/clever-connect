@@ -462,6 +462,91 @@ type StorageLog struct {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Universal Cloud Storage (rclone) Models
+// ──────────────────────────────────────────────────────────────────────────────
+
+// RcloneRemote describes one rclone-backed cloud provider endpoint (Drive,
+// SFTP host, OneDrive, Dropbox, mega, ...). Credentials are stored purely as
+// a JSON option map in the database and are injected into each rclone
+// subprocess via RCLONE_CONFIG_<NAME>_<OPTION> environment variables — no
+// rclone.conf is ever written to disk.
+type RcloneRemote struct {
+	ID uint `gorm:"primaryKey" json:"id"`
+	// Short system name. Every rclone invocation references it as "<Name>:...".
+	// Lower-case ASCII letters, digits, "_" and "-" only.
+	Name string `gorm:"type:varchar(64);uniqueIndex;not null" json:"name"`
+	// rclone provider type (e.g. "sftp", "drive", "onedrive", "ftp").
+	Type string `gorm:"type:varchar(64)" json:"type"`
+	// RootPrefix is a bucket/directory fragment inserted between the remote name
+	// and the per-upload destination path (e.g. "backups/cleverconnect/").
+	RootPrefix string `gorm:"type:varchar(255)" json:"root_prefix"`
+	// ExtraFlags holds extra safe-listed rclone flags, one per line or
+	// space-separated (e.g. "--transfers 4 --sftp-idle-timeout 10"). Validated
+	// by internal/rclone — arbitrary shell syntax is rejected.
+	ExtraFlags string `gorm:"type:text" json:"extra_flags"`
+	// Enabled controls whether scheduler jobs may target this remote.
+	Enabled bool `gorm:"default:true" json:"enabled"`
+	// Options is the provider option set serialized as a JSON object string,
+	// exactly what `rclone config providers` describes for the chosen Type.
+	Options string `gorm:"type:text" json:"options"`
+	// SecretFields caches which Options keys hold credentials (provider-defined
+	// IsPassword flags plus built-in heuristics like "pass"/"token"/"secret").
+	// They are masked in API responses and redacted from captured rclone output.
+	SecretFields  StringArray `gorm:"type:text" json:"secret_fields"`
+	LastTestOk    bool        `gorm:"default:false" json:"last_test_ok"`
+	LastTestError string      `gorm:"type:text" json:"last_test_error"`
+	LastTestAt    *time.Time  `json:"last_test_at"`
+	CreatedAt     time.Time   `json:"created_at"`
+	UpdatedAt     time.Time   `json:"updated_at"`
+}
+
+// RcloneUpload is the per-file ledger of one cloud transfer: local source,
+// remote destination, status, the provider-side metadata captured with
+// `lsjson --stat` after a successful upload, and the public share link created
+// with `link` when requested. Failed transfers keep the error detail so the
+// admin panel can display and retry them.
+type RcloneUpload struct {
+	ID             uint   `gorm:"primaryKey" json:"id"`
+	SchedulerJobID uint   `gorm:"index" json:"job_id"`
+	RemoteID       uint   `gorm:"index" json:"remote_id"`
+	RemoteName     string `gorm:"type:varchar(64)" json:"remote_name"`
+	// Absolute local source path inside the file manager sandbox.
+	LocalPath string `gorm:"type:varchar(512)" json:"local_path"`
+	// LocalRelPath is the path relative to the file manager root; relayed to
+	// the provider when keep-structure mirroring was requested.
+	LocalRelPath string `gorm:"type:varchar(512)" json:"local_rel_path"`
+	// RemotePath is the fully-qualified rclone destination: "name:root/dir/file".
+	RemotePath     string `gorm:"type:varchar(600)" json:"remote_path"`
+	Size           int64  `json:"size"`
+	PublicLink     string `gorm:"type:varchar(2048)" json:"public_link"`
+	LinkError      string `gorm:"type:text" json:"link_error"`
+	ProviderMeta   string `gorm:"type:text" json:"provider_meta"` // raw lsjson --stat result
+	TransferError  string `gorm:"type:text" json:"transfer_error"`
+	ProviderFileID string `gorm:"type:varchar(512)" json:"provider_file_id"`
+	// queued | uploading | success | failed
+	Status string `gorm:"type:varchar(20);index;default:queued" json:"status"`
+	// RequirePublicLink: when true a provider `link` was requested for the file.
+	RequirePublicLink bool       `gorm:"default:false" json:"require_public_link"`
+	TransferredAt     *time.Time `json:"transferred_at"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
+}
+
+// RcloneSystem is the singleton (ID=1) engine settings row for the universal
+// cloud storage feature: which rclone binary to use and its state.
+type RcloneSystem struct {
+	ID uint `gorm:"primaryKey" json:"id"`
+	// AutoInstall enables automatic download of the current stable rclone
+	// release from downloads.rclone.org when no usable binary is found.
+	AutoInstall bool `gorm:"default:false" json:"auto_install"`
+	// ManagedBinary records where the auto-installed binary lives (if any),
+	// so it can be found across restarts and re-verified.
+	ManagedBinary string    `gorm:"type:varchar(512)" json:"managed_binary"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // V2Ray Proxy Management Models
 // ──────────────────────────────────────────────────────────────────────────────
 
