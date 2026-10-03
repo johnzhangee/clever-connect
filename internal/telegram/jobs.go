@@ -96,7 +96,7 @@ func (p *uploadProgress) Chunk(ctx context.Context, state uploader.ProgressState
 				ReplyMarkup: restartJobMarkupBot(p.job.ID),
 			})
 		} else if p.gotdClient != nil && p.gotdPeer != nil && p.gotdMsgID != 0 {
-			_ = editGotdMessageHTML(ctx, tg.NewClient(p.gotdClient), p.gotdPeer, p.gotdMsgID, progressText, restartJobMarkupGotd(p.job.ID))
+			_ = editGotdMessageHTML(ctx, tg.NewClient(liveClient(p.gotdClient)), p.gotdPeer, p.gotdMsgID, progressText, restartJobMarkupGotd(p.job.ID))
 		}
 	}
 	return nil
@@ -168,8 +168,8 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 	}
 
 	eng := GetEngine()
-	if eng == nil {
-		return fmt.Errorf("telegram bot engine is not initialized or running")
+	if eng == nil || !eng.running.Load() {
+		return fmt.Errorf("telegram bot engine is not running — start it from the Telegram settings page (or check the Telegram engine logs)")
 	}
 
 	eng.mu.RLock()
@@ -218,7 +218,7 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 
 	// Reuse the engine's already-running MTProto client instead of creating a new one.
 	// This eliminates cold auth handshakes and halves connection overhead.
-	if eng.gotdClient == nil {
+	if eng.currentClient() == nil {
 		return fmt.Errorf("MTProto client is not initialized — cannot upload via MTProto")
 	}
 
@@ -228,9 +228,13 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 
 	// The engine's gotdClient is already running inside client.Run().
 	// We can use the engine's gotdCtx to execute API calls directly.
-	api := tg.NewClient(eng.gotdClient)
+	api := tg.NewClient(eng.currentClient())
 
-	peer, err := resolveInputPeer(eng.gotdCtx, api, chatID)
+	// Peer resolution is a read-only RPC — retry transient transport failures
+	// so a dead connection cannot kill the job before the upload even starts.
+	resolveAPI := tg.NewClient(newRetryingInvoker("upload-peer-resolve",
+		func() (tg.Invoker, error) { return liveClient(nil), nil }, nil))
+	peer, err := resolveInputPeer(eng.gotdCtx, resolveAPI, chatID)
 	if err != nil {
 		return fmt.Errorf("failed to resolve peer for chat ID: %w", err)
 	}
@@ -285,13 +289,13 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 		lastUpdate:  time.Now(),
 		threads:     threads,
 		logFn:       logFn,
-		gotdClient:  eng.gotdClient,
+		gotdClient:  eng.currentClient(),
 		gotdPeer:    peer,
 		gotdMsgID:   pMsgID,
 	}
 
 	logFn("INFO", fmt.Sprintf("Uploading file with %d parallel threads...", threads))
-	inputFile, err := FastUploadFile(eng.gotdCtx, eng.gotdClient, safePath, progressTracker)
+	inputFile, err := FastUploadFile(eng.gotdCtx, eng.currentClient(), safePath, progressTracker)
 	if err != nil {
 		return fmt.Errorf("file upload failed: %w", err)
 	}
@@ -479,8 +483,11 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 		mediaOption = doc
 	}
 
-	// Send media post — only attach download button if URL is a valid public HTTPS link
-	sender := message.NewSender(api)
+	// Send media post — only attach download button if URL is a valid public HTTPS link.
+	// Re-resolve the live client in case the MTProto client was replaced
+	// mid-upload by the self-healing supervisor — the fresh client must send
+	// the final media message.
+	sender := message.NewSender(tg.NewClient(liveClient(eng.currentClient())))
 
 	if strings.HasPrefix(absoluteDownloadURL, "https://") {
 		kbMarkup := &tg.ReplyInlineMarkup{
@@ -685,18 +692,23 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 	}
 
 	eng := GetEngine()
-	if eng == nil {
-		return fmt.Errorf("telegram bot engine is not initialized or running")
+	if eng == nil || !eng.running.Load() {
+		return fmt.Errorf("telegram bot engine is not running — start it from the Telegram settings page (or check the Telegram engine logs)")
 	}
 
-	if eng.gotdClient == nil {
+	if eng.currentClient() == nil {
 		return fmt.Errorf("MTProto client is not initialized")
 	}
 
-	api := tg.NewClient(eng.gotdClient)
+	api := tg.NewClient(eng.currentClient())
+
+	// Peer resolution is a read-only RPC — retry transient transport failures
+	// so a dead connection cannot kill the job before the download even starts.
+	resolveAPI := tg.NewClient(newRetryingInvoker("download-peer-resolve",
+		func() (tg.Invoker, error) { return liveClient(nil), nil }, nil))
 
 	// 1. Resolve peer
-	peer, err := resolveInputPeer(eng.gotdCtx, api, payload.ChatID)
+	peer, err := resolveInputPeer(eng.gotdCtx, resolveAPI, payload.ChatID)
 	if err != nil {
 		return fmt.Errorf("failed to resolve peer for chat ID: %w", err)
 	}
@@ -862,7 +874,7 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 						},
 					},
 				}
-				sender := message.NewSender(api)
+				sender := message.NewSender(tg.NewClient(liveClient(eng.currentClient())))
 				_, _ = sender.To(peer).Markup(kbMarkup).StyledText(eng.gotdCtx, html.String(nil, successText))
 			}
 
@@ -886,7 +898,7 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 			progressMsg = msg
 		}
 	} else {
-		sender := message.NewSender(api)
+		sender := message.NewSender(tg.NewClient(liveClient(eng.currentClient())))
 		kbMarkup := restartJobMarkupGotd(job.ID)
 		msg, err := sender.To(peer).Markup(kbMarkup).StyledText(eng.gotdCtx, html.String(nil, initialText))
 		if err == nil {
@@ -913,7 +925,7 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 	lastUpdate := time.Now()
 	startTime := time.Now()
 
-	err = FastDownloadFile(eng.gotdCtx, eng.gotdClient, fileDCID, fileLocation, safePath, fileSize, func(downloaded, total int64) {
+	err = FastDownloadFile(eng.gotdCtx, eng.currentClient(), fileDCID, fileLocation, safePath, fileSize, func(downloaded, total int64) {
 		percent := int(100 * float64(downloaded) / float64(total))
 		if percent > 100 {
 			percent = 100

@@ -497,10 +497,12 @@ func isPoolFailure(err error) bool {
 // It automatically calculates optimal threads based on file size.
 // The progress parameter is optional — pass nil to skip progress tracking.
 //
-// Robustness ladder: the client's cached multi-connection pool → a fresh pool
-// (if the cached one died or went stale) → the primary connection (slower, but
-// always works). Large files must never fail permanently just because a
-// connection pool misbehaved.
+// Robustness: every part request transparently retries transient transport
+// failures (broken pipes, dead connections, restarted engines) on fresh
+// connections, re-resolving the live engine's client on every attempt. A
+// dead connection pool is evicted and rebuilt mid-flight, and as a last
+// resort the whole upload is retried over the primary connection. Large
+// files must never fail permanently just because a connection blipped.
 func FastUploadFile(ctx context.Context, client *telegram.Client, filePath string, progress uploader.Progress) (tg.InputFileClass, error) {
 	info, err := os.Stat(filePath)
 	if err != nil {
@@ -527,32 +529,41 @@ func FastUploadFile(ctx context.Context, client *telegram.Client, filePath strin
 		return up.FromPath(ctx, filePath)
 	}
 
-	// Attempt 1: the client's cached multi-connection pool.
-	inputFile, err := func() (tg.InputFileClass, error) {
-		poolInvoker, perr := getUploadPoolInvoker(client)
-		if perr != nil {
-			logger.Warn("Telegram", "Failed to create upload connection pool, using primary connection", "error", perr)
-			return runUpload(client)
-		}
-		return runUpload(poolInvoker)
-	}()
+	// Every part request retries transient transport failures on fresh
+	// connections. The invoker re-resolves the live engine's client on every
+	// attempt, so an engine (or client) restart mid-upload switches to the
+	// new client without losing progress — upload file IDs are
+	// session-scoped, not client-scoped. A single dead connection therefore
+	// no longer aborts the whole multi-thread upload.
+	uploadInvoker := newRetryingInvoker("upload",
+		func() (tg.Invoker, error) {
+			c := liveClient(client)
+			pool, err := getUploadPoolInvoker(c)
+			if err != nil {
+				// The pool cannot be built right now (e.g. the client is
+				// mid-restart) — the primary connection always exists.
+				return c, nil
+			}
+			return pool, nil
+		},
+		// The pool died outright (not just one of its connections): evict
+		// it so the next attempt builds a fresh pool.
+		func(error) {
+			if c := liveClient(client); c != nil {
+				resetUploadPool(c)
+			}
+		},
+	)
 
-	// Attempt 2: the cached pool died mid-transfer or went stale (e.g. after
-	// an engine restart) — drop it and retry with brand-new connections.
-	if err != nil && isPoolFailure(err) {
-		logger.Warn("Telegram", "Upload pool failed, retrying with a fresh pool", "error", err)
-		resetUploadPool(client)
-		if poolInvoker, perr := getUploadPoolInvoker(client); perr == nil {
-			inputFile, err = runUpload(poolInvoker)
-		}
-	}
+	inputFile, err := runUpload(uploadInvoker)
 
-	// Attempt 3 (last resort): upload over the primary connection. Slower,
-	// but guarantees large files still get through when pools misbehave.
+	// Safety net for persistent pool misbehavior that per-request retries
+	// could not ride out: one full attempt over the primary connection
+	// (slower, but always available).
 	if err != nil && isPoolFailure(err) {
-		logger.Warn("Telegram", "Upload pool failed again, falling back to the primary connection", "error", err)
-		resetUploadPool(client)
-		inputFile, err = runUpload(client)
+		logger.Warn("Telegram", "Upload pool failed, falling back to the primary connection", "error", err)
+		inputFile, err = runUpload(newRetryingInvoker("upload-primary",
+			func() (tg.Invoker, error) { return liveClient(client), nil }, nil))
 	}
 
 	if err != nil {
@@ -669,23 +680,41 @@ func FastDownloadFile(ctx context.Context, client *telegram.Client, dcID int, fi
 	threads := calculateOptimalThreads(fileSize)
 
 	// Build the API client over the file's DC pool. Pools are cached per DC,
-	// so the (expensive) connection + auth transfer only happens once.
-	var api *tg.Client
-	pooled := false
-	if dcID > 0 {
-		invoker, err := getDCPoolInvoker(ctx, client, dcID)
-		if err != nil {
-			logger.Warn("Telegram", "Failed to create DC download pool, using primary connection",
-				"dc", dcID, "error", err)
-		} else {
-			api = tg.NewClient(invoker)
-			pooled = true
-		}
+	// so the (expensive) connection + auth transfer only happens once. Every
+	// part request transparently retries transient transport failures on
+	// fresh connections (see FastUploadFile) — the invoker re-resolves the
+	// live engine's client and its DC pool on every attempt, and a pool that
+	// died outright is evicted so the next attempt rebuilds it.
+	newDownloadAPI := func(dc int) *tg.Client {
+		return tg.NewClient(newRetryingInvoker("download",
+			func() (tg.Invoker, error) {
+				c := liveClient(client)
+				if dc > 0 {
+					pool, err := getDCPoolInvoker(ctx, c, dc)
+					if err == nil {
+						return pool, nil
+					}
+					logger.Warn("Telegram", "Failed to create DC download pool, using primary connection",
+						"dc", dc, "error", err)
+				}
+				return c, nil
+			},
+			func(error) {
+				if c := liveClient(client); c != nil && dc > 0 {
+					evictDCPool(c, dc)
+				}
+			},
+		))
 	}
-	if api == nil {
+
+	var api *tg.Client
+	pooled := dcID > 0
+	if pooled {
+		api = newDownloadAPI(dcID)
+	} else {
 		// Legacy path: the primary client handles DC migration transparently,
 		// but all threads share a single connection (slow).
-		api = tg.NewClient(client)
+		api = newDownloadAPI(0)
 	}
 
 	logger.Info("Telegram", "Starting fast multi-connection Telegram download",
@@ -722,13 +751,8 @@ func FastDownloadFile(ctx context.Context, client *telegram.Client, dcID int, fi
 				"from_dc", dcID, "to_dc", migrateDC)
 			dcID = migrateDC
 			threads = calculateOptimalThreads(fileSize) // fresh start for the new DC
-			if invoker, err := getDCPoolInvoker(ctx, client, dcID); err == nil {
-				api = tg.NewClient(invoker)
-				pooled = true
-			} else {
-				logger.Warn("Telegram", "Failed to create re-targeted DC pool, using primary connection",
-					"dc", dcID, "error", err)
-			}
+			api = newDownloadAPI(dcID)
+			pooled = true
 		}
 
 		lastErr = doDownloadParallel(ctx, api, fileLocation, destPath, fileSize, threads, onProgress)
@@ -742,15 +766,17 @@ func FastDownloadFile(ctx context.Context, client *telegram.Client, dcID int, fi
 			return fmt.Errorf("download cancelled: %w", ctx.Err())
 		}
 
-		// A pooled connection that died mid-request (or a stale pool left over
-		// from a previous engine run) surfaces as an "invoke pool" / "DC
-		// closed" error. Evict the poisoned pool so this attempt and future
-		// jobs get fresh connections.
+		// A pool that died outright (mid-request or stale from a previous
+		// engine run) surfaces as an "invoke pool" / "DC closed" error after
+		// per-request retries were exhausted. Evict the poisoned pool and
+		// finish over the primary connection.
 		if pooled && isPoolFailure(lastErr) {
-			logger.Warn("Telegram", "Download pool connection died mid-transfer, evicting cached pool",
+			logger.Warn("Telegram", "Download pool died mid-transfer, evicting cached pool",
 				"dc", dcID, "error", lastErr)
-			evictDCPool(client, dcID)
-			api = tg.NewClient(client)
+			if c := liveClient(client); c != nil {
+				evictDCPool(c, dcID)
+			}
+			api = newDownloadAPI(0)
 			pooled = false
 		}
 
@@ -766,7 +792,9 @@ func FastDownloadFile(ctx context.Context, client *telegram.Client, dcID int, fi
 	// all). The primary client resolves DC migration internally, so this path
 	// succeeds even when every pool strategy has failed.
 	logger.Warn("Telegram", "Falling back to sequential stream download", "error", lastErr)
-	streamErr := doDownloadStream(ctx, tg.NewClient(client), fileLocation, destPath, fileSize, onProgress)
+	streamAPI := tg.NewClient(newRetryingInvoker("download-stream",
+		func() (tg.Invoker, error) { return liveClient(client), nil }, nil))
+	streamErr := doDownloadStream(ctx, streamAPI, fileLocation, destPath, fileSize, onProgress)
 	if streamErr == nil {
 		logger.Info("Telegram", "Stream fallback download completed", "dest", filepath.Base(destPath))
 		return nil

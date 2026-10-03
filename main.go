@@ -184,13 +184,32 @@ func main() {
 
 	// (Combiner auto-start deferred to after handler creation below)
 
-	// Auto-start Telegram bot engine if configured and active
+	// Auto-start Telegram bot engine if configured and active. The engine has
+	// two auth modes, each with its own precondition:
+	//   - "user": a verified MTProto session file must exist (BotToken is
+	//     always empty in this mode — requiring it silently disabled
+	//     auto-start after every restart).
+	//   - "bot" (default): a bot token must be configured.
 	if cfg.AppMode == "server" {
 		var telegramCfg models.TelegramConfig
-		if err := db.DB.First(&telegramCfg).Error; err == nil && telegramCfg.IsActive && telegramCfg.BotToken != "" {
-			logger.Info("Telegram", "Auto-starting Telegram bot engine")
-			if err := telegram.StartEngine(&telegramCfg); err != nil {
-				logger.Error("Telegram", "Failed to auto-start Telegram bot", "error", err)
+		if err := db.DB.First(&telegramCfg).Error; err == nil && telegramCfg.IsActive {
+			switch {
+			case telegramCfg.AuthType == "user":
+				if telegram.HasUserSession() {
+					logger.Info("Telegram", "Auto-starting Telegram bot engine", "auth_type", "user")
+					if err := telegram.StartEngine(&telegramCfg); err != nil {
+						logger.Error("Telegram", "Failed to auto-start Telegram bot engine", "error", err)
+					}
+				} else {
+					logger.Warn("Telegram", "Skipping Telegram auto-start: user session not verified yet — complete User Account Verification in Telegram settings first")
+				}
+			case telegramCfg.BotToken != "":
+				logger.Info("Telegram", "Auto-starting Telegram bot engine", "auth_type", "bot")
+				if err := telegram.StartEngine(&telegramCfg); err != nil {
+					logger.Error("Telegram", "Failed to auto-start Telegram bot engine", "error", err)
+				}
+			default:
+				logger.Warn("Telegram", "Skipping Telegram auto-start: bot token is not configured")
 			}
 		}
 	}

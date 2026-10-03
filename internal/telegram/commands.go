@@ -416,14 +416,14 @@ func getPeerInput(peer tg.PeerClass, entities tg.Entities) tg.InputPeerClass {
 
 func (e *Engine) sendUserMessage(ctx context.Context, entities tg.Entities, peer tg.PeerClass, text string) error {
 	inputPeer := getPeerInput(peer, entities)
-	sender := message.NewSender(tg.NewClient(e.gotdClient))
+	sender := message.NewSender(tg.NewClient(e.currentClient()))
 	htmlText := mdToHTML(text)
 	_, err := sender.To(inputPeer).StyledText(ctx, html.String(nil, htmlText))
 	return err
 }
 
 func (e *Engine) handleUserCallbackQuery(ctx context.Context, entities tg.Entities, u *tg.UpdateBotCallbackQuery) error {
-	api := tg.NewClient(e.gotdClient)
+	api := tg.NewClient(e.currentClient())
 
 	data := string(u.Data)
 	logger.Info("Telegram", "Callback received (MTProto)", "data", data, "user_id", u.UserID)
@@ -594,7 +594,7 @@ func (e *Engine) handleFileBrowseUser(ctx context.Context, entities tg.Entities,
 	kbMarkup := &tg.ReplyInlineMarkup{Rows: kbRows}
 	htmlText := mdToHTML(text)
 
-	api := tg.NewClient(e.gotdClient)
+	api := tg.NewClient(e.currentClient())
 	if messageID != 0 {
 		// Editing via the raw RPC would render the HTML tags literally (MTProto
 		// has no parse mode); the message builder parses them into entities.
@@ -677,7 +677,10 @@ func (e *Engine) sendFileToChatUser(ctx context.Context, entities tg.Entities, p
 	}
 
 	inputPeer := getPeerInput(peer, entities)
-	api := tg.NewClient(e.gotdClient)
+	// Upload part requests are idempotent — retry transient transport
+	// failures (dead connections) on fresh connections.
+	api := tg.NewClient(newRetryingInvoker("command-upload",
+		func() (tg.Invoker, error) { return liveClient(e.currentClient()), nil }, nil))
 	up := uploader.NewUploader(api)
 
 	fileObj, err := up.FromPath(ctx, safePath)

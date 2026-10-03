@@ -6,7 +6,6 @@ package telegram
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -36,7 +35,7 @@ import (
 // Engine holds the running telebot instance and worker pool.
 type Engine struct {
 	Bot         *tele.Bot        // nil if AuthType == "user"
-	gotdClient  *telegram.Client // nil if AuthType == "bot"
+	gotdClient  *telegram.Client // nil if AuthType == "bot"; guarded by clientMu
 	gotdCtx     context.Context
 	gotdCancel  context.CancelFunc
 	meUsername  string
@@ -50,6 +49,9 @@ type Engine struct {
 	running     atomic.Bool
 	startedAt   time.Time
 	mu          sync.RWMutex
+	// clientMu guards gotdClient: the self-healing supervisor may replace
+	// the MTProto client at runtime, while jobs read it concurrently.
+	clientMu sync.RWMutex
 
 	// Metrics (atomic for lock-free reads from API)
 	messagesProcessed atomic.Int64
@@ -91,6 +93,22 @@ func GetEngine() *Engine {
 func IsRunning() bool {
 	e := GetEngine()
 	return e != nil && e.running.Load()
+}
+
+// currentClient returns the live MTProto client (nil when none exists). The
+// self-healing supervisor may replace the client at runtime after a crash, so
+// callers must re-fetch it per operation instead of caching it.
+func (e *Engine) currentClient() *telegram.Client {
+	e.clientMu.RLock()
+	defer e.clientMu.RUnlock()
+	return e.gotdClient
+}
+
+// setGotdClient publishes a new (possibly replacement) MTProto client.
+func (e *Engine) setGotdClient(c *telegram.Client) {
+	e.clientMu.Lock()
+	e.gotdClient = c
+	e.clientMu.Unlock()
 }
 
 // UserSessionPath returns the filesystem path of the MTProto user session file.
@@ -145,7 +163,7 @@ func StartEngine(cfg *models.TelegramConfig) error {
 
 	sessionDir := filepath.Join("./data/manager", ".telegram")
 	_ = os.MkdirAll(sessionDir, 0755)
-	
+
 	var sessionPath string
 	if cfg.AuthType == "user" {
 		sessionPath = UserSessionPath()
@@ -183,7 +201,7 @@ func StartEngine(cfg *models.TelegramConfig) error {
 	}
 
 	client := telegram.NewClient(appID, appHash, opts)
-	eng.gotdClient = client
+	eng.setGotdClient(client)
 	eng.gotdCtx = ctx
 	eng.gotdCancel = cancel
 
@@ -208,31 +226,44 @@ func StartEngine(cfg *models.TelegramConfig) error {
 		})
 	}
 
-	// Start gotd client
+	// Start the gotd client under a self-healing supervisor.
+	//
+	// gotd reconnects individual connections automatically, but client.Run can
+	// still exit on fatal errors (session/auth failures, unrecoverable MTProto
+	// state). A dead client would strand every in-flight transfer on
+	// "engine forcibly closed" errors until a human restarts the engine, so
+	// the supervisor transparently replaces the client (a fresh instance over
+	// the same persisted session) with capped exponential backoff until the
+	// engine itself is stopped. Because the engine-wide request context
+	// survives client replacements, in-flight uploads/downloads keep their
+	// progress across a crash (upload file IDs are session-scoped, not
+	// client-scoped).
 	eng.running.Store(true)
 	gotdErrChan := make(chan error, 1)
-	go func() {
-		err := client.Run(ctx, func(ctx context.Context) error {
+	clientReady := &atomic.Bool{}
+
+	runOne := func(c *telegram.Client) error {
+		return c.Run(ctx, func(runCtx context.Context) error {
 			// Perform bot authentication if in bot mode
 			if cfg.AuthType == "bot" {
-				status, err := client.Auth().Status(ctx)
+				status, err := c.Auth().Status(runCtx)
 				if err != nil {
 					return err
 				}
 				if !status.Authorized {
 					logger.Info("Telegram", "Authenticating gotd client as bot via MTProto...")
-					_, err = client.Auth().Bot(ctx, cfg.BotToken)
+					_, err = c.Auth().Bot(runCtx, cfg.BotToken)
 					if err != nil {
 						return err
 					}
 				}
 			}
 
-			self, err := client.Self(ctx)
+			self, err := c.Self(runCtx)
 			if err != nil {
 				return err
 			}
-			
+
 			eng.mu.Lock()
 			if cfg.AuthType == "user" {
 				eng.meUsername = self.Username
@@ -247,21 +278,60 @@ func StartEngine(cfg *models.TelegramConfig) error {
 				"mode", cfg.AuthType,
 			)
 
+			clientReady.Store(true)
+
 			// Signal success
 			select {
 			case gotdErrChan <- nil:
 			default:
 			}
 
-			<-ctx.Done()
+			<-runCtx.Done()
 			return nil
 		})
-		if err != nil && !errors.Is(err, context.Canceled) {
-			logger.Error("Telegram", "MTProto client run failed", "error", err)
-			eng.running.Store(false)
+	}
+
+	go func() {
+		const maxBackoff = 30 * time.Second
+		backoff := time.Second
+		for iteration := 0; ; iteration++ {
+			var c *telegram.Client
+			if iteration == 0 {
+				c = client
+			} else {
+				c = telegram.NewClient(appID, appHash, opts)
+				eng.setGotdClient(c)
+				logger.Warn("Telegram", "MTProto client restarted after failure", "backoff", backoff)
+			}
+
+			err := runOne(c)
+			if ctx.Err() != nil {
+				return // engine stopped — clean exit
+			}
+
+			// The very first run failed before the client ever became ready
+			// (bad token, missing/revoked session, …) — a startup error.
+			// Surface it to StartEngine and give up, exactly like the old
+			// single-shot behavior did.
+			if iteration == 0 && !clientReady.Load() {
+				select {
+				case gotdErrChan <- err:
+				default:
+				}
+				return
+			}
+
+			logger.Error("Telegram", "MTProto client run failed, restarting",
+				"error", err,
+				"backoff", backoff,
+			)
 			select {
-			case gotdErrChan <- err:
-			default:
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			if backoff < maxBackoff {
+				backoff *= 2
 			}
 		}
 	}()
@@ -430,15 +500,15 @@ func (e *Engine) Stats() map[string]interface{} {
 	e.mu.RUnlock()
 
 	return map[string]interface{}{
-		"running":             e.running.Load(),
-		"uptime_seconds":      int(time.Since(e.startedAt).Seconds()),
-		"workers":             runtime.NumCPU(),
-		"messages_processed":  e.messagesProcessed.Load(),
-		"commands_processed":  e.commandsProcessed.Load(),
-		"files_sent":          e.filesSent.Load(),
-		"errors":              e.errors.Load(),
-		"bot_username":        meUsername,
-		"bot_id":              meID,
+		"running":            e.running.Load(),
+		"uptime_seconds":     int(time.Since(e.startedAt).Seconds()),
+		"workers":            runtime.NumCPU(),
+		"messages_processed": e.messagesProcessed.Load(),
+		"commands_processed": e.commandsProcessed.Load(),
+		"files_sent":         e.filesSent.Load(),
+		"errors":             e.errors.Load(),
+		"bot_username":       meUsername,
+		"bot_id":             meID,
 	}
 }
 
