@@ -316,24 +316,26 @@ func (h *TorrentHandler) SelectTorrentFiles(c *gin.Context) {
 		if t.InfoHash().HexString() == input.InfoHash {
 			select {
 			case <-t.GotInfo():
-				files := t.Files()
-				selectedIndexMap := make(map[int]bool)
-				for _, idx := range input.SelectedFiles {
-					selectedIndexMap[idx] = true
+				// Normalise the selection JSON: nil / failed marshal becomes
+				// "[]" (no files) so it is never confused with "all files".
+				selBytes, err := json.Marshal(input.SelectedFiles)
+				if err != nil || string(selBytes) == "null" {
+					selBytes = []byte("[]")
 				}
 
-				for i, f := range files {
-					if selectedIndexMap[i] {
-						f.Download()
-					} else {
-						f.Cancel()
-					}
-				}
+				// Persist file selection to database (restarts re-apply it).
+				db.DB.Model(&models.TorrentJob{}).Where("info_hash = ?", input.InfoHash).
+					Update("selected_files", string(selBytes))
 
-				// Persist file selection to database
-				if selBytes, err := json.Marshal(input.SelectedFiles); err == nil {
-					db.DB.Model(&models.TorrentJob{}).Where("info_hash = ?", input.InfoHash).Update("selected_files", string(selBytes))
+				// Resolve the save directory for the pre-download existence
+				// check (local disk + S3), then apply the priorities —
+				// asynchronously, since the check may hash existing files.
+				saveDir := ""
+				var job models.TorrentJob
+				if err := db.DB.Where("info_hash = ?", input.InfoHash).First(&job).Error; err == nil {
+					saveDir = job.SaveDirectory
 				}
+				go torrent.Manager.ApplyFilePriorities(t, string(selBytes), saveDir)
 
 				c.JSON(http.StatusOK, gin.H{"status": "priorities_updated"})
 				return

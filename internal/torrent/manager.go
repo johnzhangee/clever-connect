@@ -57,9 +57,10 @@ type TorrentManager struct {
 	client          *torrent.Client
 	mu              sync.Mutex
 	speeds          map[string]*torrentSpeed
-	registeredFiles map[string]bool // tracks per-file S3 registration (infoHash:filePath)
-	completing      map[string]bool // infoHash -> true while a torrent is being archived to S3
-	archiveSem      chan struct{}   // bounds concurrent S3 archive (move) transfers: one per CPU core
+	registeredFiles map[string]bool  // tracks per-file S3 registration (infoHash:filePath)
+	completing      map[string]bool  // infoHash -> true while a torrent is being archived to S3
+	skippedBytes    map[string]int64 // infoHash -> bytes satisfied from S3 without a local copy (progress compensation)
+	archiveSem      chan struct{}    // bounds concurrent S3 archive (move) transfers: one per CPU core
 	stopStats       chan struct{}
 	uploadLimiter   *rate.Limiter
 	downloadLimiter *rate.Limiter
@@ -182,6 +183,7 @@ func Init() error {
 		speeds:          make(map[string]*torrentSpeed),
 		registeredFiles: make(map[string]bool),
 		completing:      make(map[string]bool),
+		skippedBytes:    make(map[string]int64),
 		archiveSem:      make(chan struct{}, runtime.NumCPU()),
 		stopStats:       make(chan struct{}),
 		uploadLimiter:   uploadLimiter,
@@ -208,10 +210,10 @@ func Init() error {
 					Manager.InjectTrackers(t)
 					if job.Status == "paused" {
 						t.DisallowDataDownload()
-						go Manager.ApplyFilePriorities(t, job.SelectedFiles)
+						go Manager.ApplyFilePriorities(t, job.SelectedFiles, job.SaveDirectory)
 					} else {
 						t.AllowDataDownload()
-						go Manager.ApplyFilePriorities(t, job.SelectedFiles)
+						go Manager.ApplyFilePriorities(t, job.SelectedFiles, job.SaveDirectory)
 					}
 				}
 			} else if job.TorrentPath != "" {
@@ -223,10 +225,10 @@ func Init() error {
 							Manager.InjectTrackers(t)
 							if job.Status == "paused" {
 								t.DisallowDataDownload()
-								go Manager.ApplyFilePriorities(t, job.SelectedFiles)
+								go Manager.ApplyFilePriorities(t, job.SelectedFiles, job.SaveDirectory)
 							} else {
 								t.AllowDataDownload()
-								go Manager.ApplyFilePriorities(t, job.SelectedFiles)
+								go Manager.ApplyFilePriorities(t, job.SelectedFiles, job.SaveDirectory)
 							}
 						}
 					}
@@ -341,18 +343,24 @@ func (m *TorrentManager) updateStats(persistDB bool) {
 		var peers int
 		var progress float64
 		var name string
+		var skipped int64
 
 		select {
 		case <-t.GotInfo():
 			// Metainfo resolved
 			totalBytes = t.Length()
 			downloaded = t.BytesCompleted()
+			// Bytes already satisfied without a swarm download (S3 skips from
+			// the pre-download check) so fully-skipped torrents still reach
+			// 100% and trigger completion. Raw `downloaded` keeps feeding the
+			// speed-delta calculation below.
+			skipped = m.skippedBytes[infoHash]
 			stats := t.Stats()
 			uploaded = stats.BytesWritten.Int64()
 			peers = stats.ActivePeers
 			name = t.Name()
 			if totalBytes > 0 {
-				progress = (float64(downloaded) / float64(totalBytes)) * 100.0
+				progress = (float64(downloaded+skipped) / float64(totalBytes)) * 100.0
 			}
 		default:
 			// Metainfo still fetching
@@ -395,7 +403,7 @@ func (m *TorrentManager) updateStats(persistDB bool) {
 		if err := db.DB.Where("info_hash = ?", infoHash).First(&job).Error; err == nil {
 			job.Name = name
 			job.TotalBytes = totalBytes
-			job.Downloaded = downloaded
+			job.Downloaded = downloaded + skipped
 			job.Uploaded = uploaded
 			job.Progress = progress
 			job.DownloadSpeed = speedInfo.downloadSpeed
@@ -404,7 +412,7 @@ func (m *TorrentManager) updateStats(persistDB bool) {
 
 			// Update state based on download status
 			if job.Status != "paused" && totalBytes > 0 {
-				if downloaded >= totalBytes {
+				if downloaded+skipped >= totalBytes {
 					if job.Status != "seeding" && job.Status != "completed" {
 						job.Status = "seeding"
 						m.completing[infoHash] = true
@@ -487,7 +495,9 @@ func (m *TorrentManager) AddMagnet(uri string, saveDir string, selectFiles bool)
 		t.DisallowDataDownload()
 	} else {
 		t.AllowDataDownload()
-		t.DownloadAll()
+		// Pre-download existence check: files already verified on disk or in
+		// S3 are skipped instead of re-downloaded (see precheck.go).
+		go m.ApplyFilePriorities(t, "", saveDir)
 	}
 
 	return infoHash, nil
@@ -549,7 +559,9 @@ func (m *TorrentManager) AddTorrentFile(torrentPath string, saveDir string, sele
 		}
 	} else {
 		t.AllowDataDownload()
-		t.DownloadAll()
+		// Pre-download existence check: files already verified on disk or in
+		// S3 are skipped instead of re-downloaded (see precheck.go).
+		go m.ApplyFilePriorities(t, "", saveDir)
 	}
 
 	return infoHash, nil
@@ -585,6 +597,11 @@ func (m *TorrentManager) DeleteTorrent(infoHash string, deleteFiles bool) {
 			break
 		}
 	}
+
+	// Forget any pre-download skip compensation for this torrent.
+	m.mu.Lock()
+	delete(m.skippedBytes, infoHash)
+	m.mu.Unlock()
 
 	var job models.TorrentJob
 	if err := db.DB.Where("info_hash = ?", infoHash).First(&job).Error; err == nil {
@@ -650,34 +667,84 @@ func (m *TorrentManager) TorrentByHash(infoHash string) *torrent.Torrent {
 	return nil
 }
 
-// ApplyFilePriorities parses the selected files JSON string and sets the torrent file priorities
-func (m *TorrentManager) ApplyFilePriorities(t *torrent.Torrent, selectedFilesJSON string) {
+// ApplyFilePriorities parses the selected files JSON string and sets per-file
+// download priorities. Before a selected file is marked for download, the
+// pre-download existence check (precheckFile) runs: files that already exist
+// in a verified-healthy state — on the local disk or in S3 — are skipped, so
+// the swarm only ever delivers bytes that are missing or corrupt.
+//
+// selectedFilesJSON is "" / "null" / unparsable ⇒ every file is wanted.
+//
+// MUST be called from a goroutine: it waits for metadata and performs disk
+// hashing, registry lookups and S3 HEAD requests. It never holds the manager
+// mutex for the check itself — only briefly for skippedBytes bookkeeping.
+func (m *TorrentManager) ApplyFilePriorities(t *torrent.Torrent, selectedFilesJSON, saveDir string) {
 	<-t.GotInfo()
 
-	if selectedFilesJSON == "" || selectedFilesJSON == "null" {
-		t.DownloadAll()
-		return
-	}
-
-	var selectedIndices []int
-	if err := json.Unmarshal([]byte(selectedFilesJSON), &selectedIndices); err != nil {
-		t.DownloadAll()
-		return
-	}
-
+	infoHash := t.InfoHash().HexString()
 	files := t.Files()
-	selectedIndexMap := make(map[int]bool)
+
+	allFiles := selectedFilesJSON == "" || selectedFilesJSON == "null"
+	var selectedIndices []int
+	if !allFiles {
+		if err := json.Unmarshal([]byte(selectedFilesJSON), &selectedIndices); err != nil {
+			allFiles = true
+		}
+	}
+	selectedIndexMap := make(map[int]bool, len(selectedIndices))
 	for _, idx := range selectedIndices {
 		selectedIndexMap[idx] = true
 	}
 
+	if saveDir == "" {
+		saveDir = "./data/manager/downloads"
+	}
+	absSaveDir, err := filepath.Abs(saveDir)
+	if err != nil {
+		absSaveDir = saveDir
+	}
+
+	// Re-derive the S3-skip compensation from scratch on every application.
+	m.mu.Lock()
+	m.skippedBytes[infoHash] = 0
+	m.mu.Unlock()
+
+	var skippedFromS3 int64
+	skippedLocal, skippedS3, toDownload := 0, 0, 0
+
 	for i, f := range files {
-		if selectedIndexMap[i] {
-			f.Download()
-		} else {
+		if !allFiles && !selectedIndexMap[i] {
 			f.Cancel()
+			continue
+		}
+		switch m.precheckFile(t, f, absSaveDir, infoHash) {
+		case precheckSkipS3:
+			// Nothing to fetch — the authoritative copy is confirmed in S3.
+			f.Cancel()
+			skippedFromS3 += f.Length()
+			skippedS3++
+			// Chain the downstream Telegram upload (dedup-safe), matching
+			// what a re-downloaded file would trigger at completion time.
+			chainTelegramUploadDirect(filepath.Clean(filepath.Join(absSaveDir, f.Path())), 0, infoHash)
+		case precheckSkipLocal:
+			// Verified on disk — the per-file completion hooks in
+			// updateStats pick it up once BytesCompleted reflects the
+			// verified pieces; no priority is needed.
+			f.Cancel()
+			skippedLocal++
+		default:
+			f.Download()
+			toDownload++
 		}
 	}
+
+	m.mu.Lock()
+	m.skippedBytes[infoHash] = skippedFromS3
+	m.mu.Unlock()
+
+	logger.Info("Torrent", "Pre-download check complete",
+		"info_hash", infoHash, "files", len(files),
+		"skipped_local", skippedLocal, "skipped_s3", skippedS3, "downloading", toDownload)
 }
 
 // registerTorrentFile has been replaced by the inline S3 archive pipeline.
