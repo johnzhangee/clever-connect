@@ -72,20 +72,37 @@ func (h *StorageHandler) SaveConfig(c *gin.Context) {
 	if incoming.MaxConcurrentUploads > 16 {
 		incoming.MaxConcurrentUploads = 16
 	}
+	// Admission reserve sanity: 1–50 % of the disk and 1–100 GB absolute
+	// floor, so the queue can neither admit blindly nor wait forever.
+	if incoming.AdmissionReservePercent < 1 {
+		incoming.AdmissionReservePercent = 1
+	}
+	if incoming.AdmissionReservePercent > 50 {
+		incoming.AdmissionReservePercent = 50
+	}
+	if incoming.AdmissionReserveMinGB < 1 {
+		incoming.AdmissionReserveMinGB = 1
+	}
+	if incoming.AdmissionReserveMinGB > 100 {
+		incoming.AdmissionReserveMinGB = 100
+	}
 	incoming.HighWatermarkPercent = high
 	incoming.PauseWatermarkPercent = pause
 
 	updates := map[string]interface{}{
-		"s3_enabled":              incoming.S3Enabled,
-		"offload_on_completion":   incoming.OffloadOnCompletion,
-		"evict_after_upload":      incoming.EvictAfterUpload,
-		"high_watermark_percent":  high,
-		"pause_watermark_percent": pause,
-		"stream_threshold_gb":     incoming.StreamThresholdGB,
-		"batch_size_gb":           incoming.BatchSizeGB,
-		"max_concurrent_uploads":  incoming.MaxConcurrentUploads,
-		"s3_prefix":               incoming.S3Prefix,
-		"stop_seeding_on_offload": incoming.StopSeedingOnOffload,
+		"s3_enabled":                incoming.S3Enabled,
+		"offload_on_completion":     incoming.OffloadOnCompletion,
+		"evict_after_upload":        incoming.EvictAfterUpload,
+		"high_watermark_percent":    high,
+		"pause_watermark_percent":   pause,
+		"stream_threshold_gb":       incoming.StreamThresholdGB,
+		"batch_size_gb":             incoming.BatchSizeGB,
+		"max_concurrent_uploads":    incoming.MaxConcurrentUploads,
+		"s3_prefix":                 incoming.S3Prefix,
+		"stop_seeding_on_offload":   incoming.StopSeedingOnOffload,
+		"admission_enabled":         incoming.AdmissionEnabled,
+		"admission_reserve_percent": incoming.AdmissionReservePercent,
+		"admission_reserve_min_gb":  incoming.AdmissionReserveMinGB,
 	}
 	if err := db.DB.Model(&models.StorageConfig{}).Where("id = ?", current.ID).
 		Updates(updates).Error; err != nil {

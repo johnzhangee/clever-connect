@@ -62,21 +62,22 @@ func logEvent(level, source, msg string) {
 	})
 }
 
-// s3Available reports whether relaying to S3 is possible right now.
-func s3Available() bool {
-	return Enabled()
-}
-
 // sweep is the guard heartbeat: watermarks first (safety), then per-torrent
 // offloading, then global pressure eviction and counter bookkeeping.
 func (g *Guard) sweep() {
 	cfg := LoadConfig()
-	if !s3Available() {
-		return
-	}
 
+	// Watermark enforcement FIRST and unconditionally: the pause watermark is
+	// the last-resort disk protection and must never depend on S3 health.
 	usage := getDiskUsage(stageDir())
 	g.enforceWatermarks(cfg, usage)
+
+	g.mu.Lock()
+	ready := g.offloadReady
+	g.mu.Unlock()
+	if !ready {
+		return // watermark-only mode (no bucket): nothing to offload
+	}
 	pressure := usage.Valid && usage.UsedPercent >= float64(cfg.HighWatermarkPercent)
 
 	// Track jobs seen this sweep so speed snapshots can be pruned.
@@ -163,7 +164,7 @@ func (g *Guard) setAllDownloadFlow(allow bool, reason string) {
 					"status":          "downloading",
 				})
 			}
-		} else if !job.PausedByGuard && job.Status != "paused" {
+		} else if !job.PausedByGuard && job.Status != "paused" && job.Status != "queued" {
 			t.DisallowDataDownload()
 			db.DB.Model(&job).Updates(map[string]interface{}{
 				"paused_by_guard": true,

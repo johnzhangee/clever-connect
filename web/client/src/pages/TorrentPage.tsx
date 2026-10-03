@@ -54,16 +54,18 @@ const TorrentProgressBar: React.FC<{ progress: number; status: string }> = ({ pr
 	const isDownloading = status === 'downloading';
 	const isCompleted = status === 'completed' || status === 'seeding';
 	const isPaused = status === 'paused';
+	const isQueued = status === 'queued';
+	const isIdle = isPaused || isQueued;
 
-	const outerCircleColor = isCompleted ? '#166534' : isPaused ? '#374151' : '#ea580c';
-	const trackBorderColor = isCompleted ? '#22c55e' : isPaused ? '#4b5563' : '#f97316';
+	const outerCircleColor = isCompleted ? '#166534' : isIdle ? '#374151' : '#ea580c';
+	const trackBorderColor = isCompleted ? '#22c55e' : isIdle ? '#4b5563' : '#f97316';
 	const fillGradient = isCompleted 
 		? 'linear-gradient(180deg, #4ade80 0%, #22c55e 100%)' 
-		: isPaused 
+		: isIdle 
 		? 'linear-gradient(180deg, #9ca3af 0%, #4b5563 100%)' 
 		: 'linear-gradient(180deg, #fbbf24 0%, #ea580c 100%)';
 
-	const lightningColor = isCompleted ? '#4ade80' : isPaused ? '#9ca3af' : '#38bdf8';
+	const lightningColor = isCompleted ? '#4ade80' : isIdle ? '#9ca3af' : '#38bdf8';
 
 	return (
 		<div style={{ display: 'flex', alignItems: 'center', position: 'relative', width: '100%', height: 44, margin: '6px 0' }}>
@@ -881,10 +883,10 @@ export const TorrentPage: React.FC = () => {
 											fontWeight: 700,
 											padding: '2px 6px',
 											borderRadius: 4,
-											background: t.status === 'downloading' ? 'rgba(56, 189, 248, 0.1)' : t.status === 'completed' || t.status === 'seeding' ? 'rgba(34, 197, 94, 0.1)' : 'rgba(156, 163, 175, 0.1)',
-											color: t.status === 'downloading' ? '#0284c7' : t.status === 'completed' || t.status === 'seeding' ? '#16a34a' : '#4b5563'
+											background: t.status === 'downloading' ? 'rgba(56, 189, 248, 0.1)' : t.status === 'completed' || t.status === 'seeding' ? 'rgba(34, 197, 94, 0.1)' : t.status === 'queued' ? 'rgba(245, 158, 11, 0.15)' : 'rgba(156, 163, 175, 0.1)',
+											color: t.status === 'downloading' ? '#0284c7' : t.status === 'completed' || t.status === 'seeding' ? '#16a34a' : t.status === 'queued' ? '#b45309' : '#4b5563'
 										}}>
-											{t.status}
+											{t.status === 'queued' ? 'queued · waiting for disk' : t.status}
 										</span>
 										{t.status === 'downloading' && (
 											<>

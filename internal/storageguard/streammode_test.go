@@ -7,6 +7,33 @@ import (
 	"clever-connect/internal/models"
 )
 
+func TestSelectedFileSet(t *testing.T) {
+	if all, set := selectedFileSet(""); !all || set != nil {
+		t.Errorf("empty selection: all=%v set=%v; want all with nil set", all, set)
+	}
+	if all, set := selectedFileSet("null"); !all || set != nil {
+		t.Errorf("null selection: all=%v set=%v; want all with nil set", all, set)
+	}
+	if all, _ := selectedFileSet("{not json"); !all {
+		t.Error("unparsable selection must mean all files")
+	}
+	if all, set := selectedFileSet("[]"); all || set != nil {
+		t.Errorf("'[]' selection: all=%v set=%v; want none", all, set)
+	}
+	all, set := selectedFileSet("[1,3]")
+	if all {
+		t.Error("explicit selection must not be all")
+	}
+	for _, want := range []int{1, 3} {
+		if !set[want] {
+			t.Errorf("selection missing index %d", want)
+		}
+	}
+	if len(set) != 2 {
+		t.Errorf("selection size = %d; want 2", len(set))
+	}
+}
+
 func TestPlanStreamBatchesPacking(t *testing.T) {
 	gb := int64(1024 * 1024 * 1024)
 	sizes := []int64{3 * gb, 3 * gb, 3 * gb, 2 * gb} // batches: [0,1], [2,3]

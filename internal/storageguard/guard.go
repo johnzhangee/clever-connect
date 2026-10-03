@@ -49,6 +49,10 @@ type Guard struct {
 	stop          chan struct{}
 	started       bool
 	pausedByGuard bool
+	// offloadReady: S3 relay is configured and enabled. When false the guard
+	// still runs, but only enforces the disk watermarks (pause/resume) —
+	// disk protection must never depend on S3 being reachable.
+	offloadReady bool
 	// in-flight uploads: infoHash -> set of file indices
 	inflight map[string]map[int]bool
 	// "hash:idx" -> earliest retry time after a failed upload
@@ -82,12 +86,33 @@ func Init() {
 			logEvent("info", "init", fmt.Sprintf(
 				"Seeded default storage config (S3 offloading on, %d concurrent uploads)", cfg.MaxConcurrentUploads))
 		}
-	} else if cfg.MaxConcurrentUploads < autoUploadWorkers() {
-		cfg.MaxConcurrentUploads = autoUploadWorkers()
-		db.DB.Model(&models.StorageConfig{}).Where("id = ?", cfg.ID).
-			Update("max_concurrent_uploads", cfg.MaxConcurrentUploads)
-		logEvent("info", "init", fmt.Sprintf(
-			"Auto-scaled max_concurrent_uploads to %d (one S3 upload per CPU core)", cfg.MaxConcurrentUploads))
+	} else {
+		if cfg.MaxConcurrentUploads < autoUploadWorkers() {
+			cfg.MaxConcurrentUploads = autoUploadWorkers()
+			db.DB.Model(&models.StorageConfig{}).Where("id = ?", cfg.ID).
+				Update("max_concurrent_uploads", cfg.MaxConcurrentUploads)
+			logEvent("info", "init", fmt.Sprintf(
+				"Auto-scaled max_concurrent_uploads to %d (one S3 upload per CPU core)", cfg.MaxConcurrentUploads))
+		}
+		// Re-floor legacy watermark rows toward today's defaults: offload
+		// pressure once free space drops below 30% (used ≥ 70) and the hard
+		// pause at 85% used. Only tightening is applied — an admin's stricter
+		// setting is never loosened.
+		def := defaultStorageConfig()
+		if cfg.HighWatermarkPercent > def.HighWatermarkPercent {
+			cfg.HighWatermarkPercent = def.HighWatermarkPercent
+			db.DB.Model(&models.StorageConfig{}).Where("id = ?", cfg.ID).
+				Update("high_watermark_percent", cfg.HighWatermarkPercent)
+			logEvent("info", "init", fmt.Sprintf(
+				"Tightened high watermark to %d%% — offload pressure now starts at 30%% free", cfg.HighWatermarkPercent))
+		}
+		if cfg.PauseWatermarkPercent > def.PauseWatermarkPercent {
+			cfg.PauseWatermarkPercent = def.PauseWatermarkPercent
+			db.DB.Model(&models.StorageConfig{}).Where("id = ?", cfg.ID).
+				Update("pause_watermark_percent", cfg.PauseWatermarkPercent)
+			logEvent("info", "init", fmt.Sprintf(
+				"Tightened pause watermark to %d%%", cfg.PauseWatermarkPercent))
+		}
 	}
 }
 
@@ -107,16 +132,19 @@ func autoUploadWorkers() int {
 
 func defaultStorageConfig() models.StorageConfig {
 	return models.StorageConfig{
-		S3Enabled:             true,
-		OffloadOnCompletion:   true,
-		EvictAfterUpload:      true,
-		HighWatermarkPercent:  75,
-		PauseWatermarkPercent: 88,
-		StreamThresholdGB:     12,
-		BatchSizeGB:           8,
-		MaxConcurrentUploads:  autoUploadWorkers(),
-		S3Prefix:              "clever-connect/",
-		StopSeedingOnOffload:  true,
+		S3Enabled:               true,
+		OffloadOnCompletion:     true,
+		EvictAfterUpload:        true,
+		HighWatermarkPercent:    70,
+		PauseWatermarkPercent:   85,
+		StreamThresholdGB:       12,
+		BatchSizeGB:             8,
+		MaxConcurrentUploads:    autoUploadWorkers(),
+		S3Prefix:                "clever-connect/",
+		StopSeedingOnOffload:    true,
+		AdmissionEnabled:        true,
+		AdmissionReservePercent: 10,
+		AdmissionReserveMinGB:   5,
 	}
 }
 
@@ -132,20 +160,26 @@ func Working() bool {
 	return Default.started
 }
 
-// Start launches the guard loop (no-op when S3 or the feature is disabled,
-// or when already running).
+// Start launches the guard loop (no-op when already running).
+//
+// Offloading (S3 relay, eviction, stream mode) needs a usable bucket, but the
+// disk watermarks — the last-resort protection that pauses ALL downloads
+// before the disk fills — must never depend on S3 being reachable or enabled.
+// Without a bucket the guard therefore starts in watermark-only mode instead
+// of staying completely inert.
 func Start(provider TorrentProvider) {
 	if provider == nil {
 		return
 	}
+	offloadReady := true
 	if err := s3store.Init(); err != nil {
-		logger.Warn("StorageGuard", "S3 storage unavailable — smart offloading disabled", "error", err)
-		return
+		offloadReady = false
+		logger.Warn("StorageGuard", "S3 storage unavailable — offloading disabled, disk watermarks remain active", "error", err)
 	}
 	cfg := LoadConfig()
 	if !cfg.S3Enabled {
-		logger.Info("StorageGuard", "S3 offloading disabled in storage config — guard idle")
-		return
+		offloadReady = false
+		logger.Info("StorageGuard", "S3 offloading disabled in storage config — guard runs in watermark-only mode")
 	}
 
 	g := Default
@@ -158,10 +192,12 @@ func Start(provider TorrentProvider) {
 	g.stop = make(chan struct{})
 	g.started = true
 	g.pausedByGuard = false
+	g.offloadReady = offloadReady
 	g.applyUploadSlots(cfg.MaxConcurrentUploads)
 	g.mu.Unlock()
 
-	logger.Info("StorageGuard", "Storage guard started", "sweepInterval", sweepInterval.String())
+	logger.Info("StorageGuard", "Storage guard started",
+		"sweepInterval", sweepInterval.String(), "offloadReady", offloadReady)
 	go g.loop()
 }
 

@@ -2,6 +2,15 @@ package storageguard
 
 import "syscall"
 
+// DiskUsage returns the free and total byte counts of the filesystem holding
+// path. It reuses the guard's statfs math so callers (e.g. the torrent
+// manager's download admission control) judge against the exact numbers the
+// watermarks use. ok is false when the path cannot be statfs'ed.
+func DiskUsage(path string) (free, total uint64, ok bool) {
+	u := getDiskUsage(path)
+	return u.FreeBytes, u.TotalBytes, u.Valid
+}
+
 // diskUsage is a snapshot of the staging filesystem capacity numbers.
 type diskUsage struct {
 	TotalBytes  uint64

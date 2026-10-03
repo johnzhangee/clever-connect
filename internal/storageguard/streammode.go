@@ -1,6 +1,8 @@
 package storageguard
 
 import (
+	"encoding/json"
+
 	"clever-connect/internal/db"
 	"clever-connect/internal/models"
 
@@ -64,6 +66,27 @@ func batchSettled(b []int, rows map[int]*models.TorrentFileOffload, evictOn bool
 	return true
 }
 
+// selectedFileSet decodes the SelectedFiles JSON with the same semantics as
+// the torrent manager's priority funnel: "" / "null" / unparsable means every
+// file is wanted; "[]" means none; otherwise only the listed indices are.
+func selectedFileSet(selectedJSON string) (all bool, set map[int]bool) {
+	if selectedJSON == "" || selectedJSON == "null" {
+		return true, nil
+	}
+	var idx []int
+	if err := json.Unmarshal([]byte(selectedJSON), &idx); err != nil {
+		return true, nil
+	}
+	if len(idx) == 0 {
+		return false, nil
+	}
+	s := make(map[int]bool, len(idx))
+	for _, i := range idx {
+		s[i] = true
+	}
+	return false, s
+}
+
 // applyStreamMode bounds the disk footprint of giant torrents: only the
 // earliest batch that still needs work is queued for download while every
 // later batch stays cancelled until its predecessors are secured in S3.
@@ -96,12 +119,16 @@ func (g *Guard) applyStreamMode(cfg models.StorageConfig, job *models.TorrentJob
 		}
 	}
 
-	paused := job.Status == "paused" && !job.PausedByGuard
+	// A user-paused torrent, or one held in the torrent manager's disk
+	// admission queue, keeps every file cancelled until it actually runs.
+	paused := (job.Status == "paused" && !job.PausedByGuard) || job.Status == "queued"
+	selAll, selSet := selectedFileSet(job.SelectedFiles)
 	for i, f := range files {
+		want := selAll || selSet[i]
 		switch {
 		case where[i] < current:
 			f.Cancel() // earlier batch still settling: wait your turn
-		case where[i] == current && !paused:
+		case where[i] == current && !paused && want:
 			f.Download()
 		default:
 			f.Cancel()

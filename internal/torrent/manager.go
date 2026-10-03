@@ -64,6 +64,13 @@ type TorrentManager struct {
 	stopStats       chan struct{}
 	uploadLimiter   *rate.Limiter
 	downloadLimiter *rate.Limiter
+
+	// Disk admission control (admission.go): FIFO of torrents whose downloads
+	// are held until the projected disk footprint fits.
+	diskQueue []diskQueueEntry
+	// infoHash -> a funnel application is in flight for this torrent
+	// (drain-loop dedup so the queue head is not nudged twice at once).
+	applying map[string]bool
 }
 
 var Manager *TorrentManager
@@ -188,6 +195,7 @@ func Init() error {
 		stopStats:       make(chan struct{}),
 		uploadLimiter:   uploadLimiter,
 		downloadLimiter: downloadLimiter,
+		applying:        make(map[string]bool),
 	}
 
 	// Reload all existing torrent jobs from database
@@ -312,6 +320,11 @@ func (m *TorrentManager) statsLoop() {
 			// Persist DB stats every 5 seconds to reduce connection pressure.
 			// In-memory speeds are updated every tick for the UI.
 			m.updateStats(tick%5 == 0)
+			// Drain the disk-admission queue alongside the DB persist cadence:
+			// when space frees up, the longest-waiting torrent is re-applied.
+			if tick%5 == 0 {
+				m.tryAdmitQueueHead()
+			}
 		}
 	}
 }
@@ -410,8 +423,10 @@ func (m *TorrentManager) updateStats(persistDB bool) {
 			job.UploadSpeed = speedInfo.uploadSpeed
 			job.Peers = peers
 
-			// Update state based on download status
-			if job.Status != "paused" && totalBytes > 0 {
+			// Update state based on download status. "queued" torrents are
+			// held by disk admission control — the drain loop flips them
+			// back to "downloading" when they are admitted.
+			if job.Status != "paused" && job.Status != "queued" && totalBytes > 0 {
 				if downloaded+skipped >= totalBytes {
 					if job.Status != "seeding" && job.Status != "completed" {
 						job.Status = "seeding"
@@ -578,12 +593,19 @@ func (m *TorrentManager) PauseTorrent(infoHash string) {
 	}
 }
 
-// ResumeTorrent downloads all files/pieces
+// ResumeTorrent downloads all files/pieces. A torrent that was held in the
+// disk-admission queue has every file cancelled, so the saved selection is
+// re-applied (which re-runs the admission check — the torrent re-queues if
+// the disk still cannot fit it).
 func (m *TorrentManager) ResumeTorrent(infoHash string) {
 	for _, t := range m.client.Torrents() {
 		if t.InfoHash().HexString() == infoHash {
 			t.AllowDataDownload()
 			db.DB.Model(&models.TorrentJob{}).Where("info_hash = ?", infoHash).Update("status", "downloading")
+			var job models.TorrentJob
+			if err := db.DB.Where("info_hash = ?", infoHash).First(&job).Error; err == nil {
+				go m.ApplyFilePriorities(t, job.SelectedFiles, job.SaveDirectory)
+			}
 			break
 		}
 	}
@@ -598,9 +620,17 @@ func (m *TorrentManager) DeleteTorrent(infoHash string, deleteFiles bool) {
 		}
 	}
 
-	// Forget any pre-download skip compensation for this torrent.
+	// Forget any pre-download skip compensation and disk-queue state for this
+	// torrent.
 	m.mu.Lock()
 	delete(m.skippedBytes, infoHash)
+	delete(m.applying, infoHash)
+	for i, e := range m.diskQueue {
+		if e.infoHash == infoHash {
+			m.diskQueue = append(m.diskQueue[:i], m.diskQueue[i+1:]...)
+			break
+		}
+	}
 	m.mu.Unlock()
 
 	var job models.TorrentJob
@@ -673,12 +703,28 @@ func (m *TorrentManager) TorrentByHash(infoHash string) *torrent.Torrent {
 // in a verified-healthy state — on the local disk or in S3 — are skipped, so
 // the swarm only ever delivers bytes that are missing or corrupt.
 //
+// Disk admission control: after the pre-check the manager knows how many bytes
+// the swarm still has to write. If the projected disk footprint (that need
+// plus every other live download's outstanding bytes plus the configured
+// reserve) does not fit the free space, the torrent is NOT started: every
+// file stays cancelled, the job moves to the "queued" status, and the FIFO
+// disk queue holds it until space frees up (see admission.go). This is what
+// keeps several concurrent big torrents from overflowing the small Clever
+// Cloud disk.
+//
 // selectedFilesJSON is "" / "null" / unparsable ⇒ every file is wanted.
 //
 // MUST be called from a goroutine: it waits for metadata and performs disk
 // hashing, registry lookups and S3 HEAD requests. It never holds the manager
 // mutex for the check itself — only briefly for skippedBytes bookkeeping.
 func (m *TorrentManager) ApplyFilePriorities(t *torrent.Torrent, selectedFilesJSON, saveDir string) {
+	m.applyFilePriorities(t, selectedFilesJSON, saveDir)
+}
+
+// applyFilePriorities is the funnel implementation. It reports whether the
+// torrent's downloads were actually started (true) or held in the disk queue
+// (false).
+func (m *TorrentManager) applyFilePriorities(t *torrent.Torrent, selectedFilesJSON, saveDir string) bool {
 	<-t.GotInfo()
 
 	infoHash := t.InfoHash().HexString()
@@ -709,20 +755,71 @@ func (m *TorrentManager) ApplyFilePriorities(t *torrent.Torrent, selectedFilesJS
 	m.skippedBytes[infoHash] = 0
 	m.mu.Unlock()
 
+	// Run the pre-download check for every wanted file first: the decisions
+	// determine how many bytes the swarm still has to deliver, which is the
+	// number the disk admission check must budget for.
+	wanted := make([]bool, len(files))
+	decision := make([]precheckDecision, len(files))
 	var skippedFromS3 int64
+	needed := int64(0)
 	skippedLocal, skippedS3, toDownload := 0, 0, 0
 
 	for i, f := range files {
 		if !allFiles && !selectedIndexMap[i] {
+			decision[i] = precheckDownload
+			continue
+		}
+		wanted[i] = true
+		switch m.precheckFile(t, f, absSaveDir, infoHash) {
+		case precheckSkipS3:
+			decision[i] = precheckSkipS3
+			skippedFromS3 += f.Length()
+			skippedS3++
+		case precheckSkipLocal:
+			decision[i] = precheckSkipLocal
+			skippedLocal++
+		default:
+			decision[i] = precheckDownload
+			needed += f.Length()
+			toDownload++
+		}
+	}
+
+	// ── Disk admission control ────────────────────────────────────────────
+	if m.needsAdmission(infoHash, absSaveDir, t.Length(), needed) {
+		// Not enough room for this torrent's outstanding bytes: cancel every
+		// file, park the job in the FIFO disk queue, and let the stats-loop
+		// drain retry when the guard's offload/eviction frees space.
+		for _, f := range files {
+			f.Cancel()
+		}
+		newlyQueued := m.enqueueDiskQueue(infoHash)
+		if newlyQueued {
+			db.DB.Model(&models.TorrentJob{}).Where("info_hash = ?", infoHash).
+				Update("status", "queued")
+			db.DB.Create(&models.StorageLog{
+				Level:     "warn",
+				Source:    "admission",
+				Message:   "Torrent '" + t.Name() + "' queued — not enough free disk space for " + formatBytes(needed) + " of new downloads",
+				CreatedAt: time.Now(),
+			})
+			logger.Warn("Torrent", "Holding torrent until disk space frees up",
+				"info_hash", infoHash, "name", t.Name(),
+				"needed", formatBytes(needed), "waiting", m.queueLength())
+		}
+		return false
+	}
+
+	// ── Apply the per-file decisions ──────────────────────────────────────
+	for i, f := range files {
+		if !wanted[i] {
 			f.Cancel()
 			continue
 		}
-		switch m.precheckFile(t, f, absSaveDir, infoHash) {
+		switch decision[i] {
 		case precheckSkipS3:
 			// Nothing to fetch — the authoritative copy is confirmed in S3.
 			f.Cancel()
-			skippedFromS3 += f.Length()
-			skippedS3++
 			// Chain the downstream Telegram upload (dedup-safe), matching
 			// what a re-downloaded file would trigger at completion time.
 			chainTelegramUploadDirect(filepath.Clean(filepath.Join(absSaveDir, f.Path())), 0, infoHash)
@@ -731,20 +828,20 @@ func (m *TorrentManager) ApplyFilePriorities(t *torrent.Torrent, selectedFilesJS
 			// updateStats pick it up once BytesCompleted reflects the
 			// verified pieces; no priority is needed.
 			f.Cancel()
-			skippedLocal++
 		default:
 			f.Download()
-			toDownload++
 		}
 	}
 
 	m.mu.Lock()
 	m.skippedBytes[infoHash] = skippedFromS3
 	m.mu.Unlock()
+	m.dequeueDiskQueue(infoHash)
 
 	logger.Info("Torrent", "Pre-download check complete",
 		"info_hash", infoHash, "files", len(files),
 		"skipped_local", skippedLocal, "skipped_s3", skippedS3, "downloading", toDownload)
+	return true
 }
 
 // registerTorrentFile has been replaced by the inline S3 archive pipeline.

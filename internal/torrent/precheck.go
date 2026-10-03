@@ -56,6 +56,14 @@ func (m *TorrentManager) precheckFile(t *torrent.Torrent, f *torrent.File, absSa
 		// Nothing to fetch, nothing to verify.
 		return precheckSkipLocal
 	}
+
+	// Fast path: the torrent client already counts every piece of this file
+	// as completed (hash-verified by the library or marked complete by an
+	// earlier pre-check run) — there is nothing to fetch and nothing to hash
+	// again. This keeps queue-drain retries and resume re-applications cheap.
+	if f.BytesCompleted() >= f.Length() {
+		return precheckSkipLocal
+	}
 	relPath := f.Path()
 	absPath := filepath.Clean(filepath.Join(absSaveDir, relPath))
 

@@ -155,7 +155,7 @@ type TorrentJob struct {
 	MagnetURI     string  `gorm:"type:text" json:"magnet_uri"`
 	TorrentPath   string  `json:"torrent_path"` // Local path to saved .torrent
 	SaveDirectory string  `json:"save_directory"`
-	Status        string  `json:"status" gorm:"default:'downloading'"` // downloading, paused, completed, seeding, error
+	Status        string  `json:"status" gorm:"default:'downloading'"` // downloading, paused, completed, seeding, error, queued (waiting for disk space)
 	TotalBytes    int64   `json:"total_bytes"`
 	Downloaded    int64   `json:"downloaded"`
 	Uploaded      int64   `json:"uploaded"`
@@ -416,13 +416,23 @@ type StorageConfig struct {
 	// Delete local copies right after every file is confirmed in S3
 	// (keeps local disk usage near zero; streaming reads fall back to S3).
 	EvictAfterUpload bool `json:"evict_after_upload" gorm:"default:true"`
-	// Percentage of disk usage that triggers eviction of already-uploaded content.
-	HighWatermarkPercent int `json:"high_watermark_percent" gorm:"default:75"`
+	// Percentage of disk usage that triggers eviction of already-uploaded
+	// content (default 70 ⇒ offload pressure starts once free space drops
+	// below 30%).
+	HighWatermarkPercent int `json:"high_watermark_percent" gorm:"default:70"`
 	// Percentage of disk usage that pauses ALL active downloads (hard stop).
-	PauseWatermarkPercent int `json:"pause_watermark_percent" gorm:"default:88"`
+	PauseWatermarkPercent int `json:"pause_watermark_percent" gorm:"default:85"`
 	// Torrents bigger than this many GB are downloaded in sequential batches
 	// that fit the local staging area ("Stream Mode"), never overflowing disk.
 	StreamThresholdGB int `json:"stream_threshold_gb" gorm:"default:12"`
+	// Download admission control: hold new torrent downloads in a FIFO queue
+	// until the projected disk footprint fits, so several concurrent big
+	// torrents cannot overflow the small instance disk.
+	AdmissionEnabled bool `json:"admission_enabled" gorm:"default:true"`
+	// Percentage of the total disk kept free when admitting a new download.
+	AdmissionReservePercent int `json:"admission_reserve_percent" gorm:"default:10"`
+	// Absolute floor (GB) of free space kept when admitting a new download.
+	AdmissionReserveMinGB int `json:"admission_reserve_min_gb" gorm:"default:5"`
 	// Maximum size of a single stream-mode batch (GB) resident on local disk.
 	BatchSizeGB int `json:"batch_size_gb" gorm:"default:8"`
 	// Number of parallel S3 upload workers.
