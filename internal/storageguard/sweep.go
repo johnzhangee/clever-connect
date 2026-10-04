@@ -108,7 +108,7 @@ func (g *Guard) sweep() {
 	}
 
 	// Evict leftover uploaded copies of torrents no longer in the client.
-	g.evictOrphanedCopies(cfg, pressure)
+	g.evictOrphanedCopies()
 
 	// Decay speed snapshots for jobs that went away.
 	g.mu.Lock()

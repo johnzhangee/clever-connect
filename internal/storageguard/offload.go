@@ -116,8 +116,10 @@ func (g *Guard) processTorrent(cfg models.StorageConfig, pressure bool, job *mod
 		}
 	}
 
-	// enabled-but-not-yet-taken: eviction of S3-confirmed files
-	if !protected && (cfg.EvictAfterUpload || pressure) {
+	// Eviction of S3-confirmed files is unconditional: a local copy is
+	// deleted as soon as the ledger shows it secured in object storage
+	// (freeing disk), unless the user explicitly restored this torrent.
+	if !protected {
 		for i, f := range files {
 			row := rows[i]
 			if row == nil || !row.Uploaded || row.EvictedLocal {
@@ -171,7 +173,7 @@ func (g *Guard) evictLocalCopy(infoHash string, row *models.TorrentFileOffload, 
 
 // evictOrphanedCopies sweeps S3-confirmed files that still exist locally for
 // torrents that are no longer live in the client (restarts, drops, purges).
-func (g *Guard) evictOrphanedCopies(cfg models.StorageConfig, pressure bool) {
+func (g *Guard) evictOrphanedCopies() {
 	live := make(map[string]bool)
 	for _, t := range g.snapshotTorrents() {
 		live[t.InfoHash().HexString()] = true
@@ -184,9 +186,6 @@ func (g *Guard) evictOrphanedCopies(cfg models.StorageConfig, pressure bool) {
 		row := &rows[i]
 		if live[row.InfoHash] {
 			continue // handled by the live per-torrent pass
-		}
-		if !cfg.EvictAfterUpload && !pressure {
-			continue
 		}
 		if g.inflightAny(row.InfoHash, row.FileIndex) {
 			continue

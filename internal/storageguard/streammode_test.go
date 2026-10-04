@@ -83,18 +83,21 @@ func TestBatchIndexMapAndSettled(t *testing.T) {
 		0: {Uploaded: true, EvictedLocal: true},
 		1: {Uploaded: true, EvictedLocal: false},
 	}
-	if batchSettled(batches[0], rows, true) {
-		t.Error("batch must not be settled while eviction is pending")
-	}
-	if !batchSettled(batches[0], rows, false) {
-		t.Error("batch counts as settled when eviction is disabled")
+	if batchSettled(batches[0], rows) {
+		t.Error("batch must not be settled while the local copy is not yet evicted")
 	}
 	rows[1].EvictedLocal = true
-	if !batchSettled(batches[0], rows, true) {
+	if !batchSettled(batches[0], rows) {
 		t.Error("fully uploaded+evicted batch must be settled")
 	}
-	if batchSettled(batches[1], rows, true) {
+	if batchSettled(batches[1], rows) {
 		t.Error("batch with a missing row must not be settled")
+	}
+	if batchSettled(batches[0], map[int]*models.TorrentFileOffload{
+		0: {Uploaded: true, EvictedLocal: true},
+		1: {Uploaded: false, EvictedLocal: true},
+	}) {
+		t.Error("batch with an unuploaded file must not be settled")
 	}
 }
 

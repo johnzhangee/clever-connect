@@ -72,6 +72,10 @@ type TorrentManager struct {
 	// infoHash -> a funnel application is in flight for this torrent
 	// (drain-loop dedup so the queue head is not nudged twice at once).
 	applying map[string]bool
+	// infoHash -> time of the last chunk-write-error recovery. The library
+	// fires the write-error hook on every failed chunk write, so recovery is
+	// throttled per torrent to avoid a tight retry loop on a broken disk.
+	writeErrAt map[string]time.Time
 
 	// Direct-to-S3 storage dispatcher (s3torrent): routes hashes whose piece
 	// data lives in object storage. nil in unit tests that build managers
@@ -208,15 +212,17 @@ func Init() error {
 		uploadLimiter:   uploadLimiter,
 		downloadLimiter: downloadLimiter,
 		applying:        make(map[string]bool),
+		writeErrAt:      make(map[string]time.Time),
 		directS3Client:  dispatch,
 	}
 	if dispatch != nil {
 		dispatch.SetFinalizeNotifier(Manager.onDirectS3Finalized)
 	}
 
-	// Reload all existing torrent jobs from database
+	// Reload all existing torrent jobs from database, oldest first so the
+	// re-built disk queue keeps a stable order.
 	var jobs []models.TorrentJob
-	if err := db.DB.Find(&jobs).Error; err == nil {
+	if err := db.DB.Order("created_at").Find(&jobs).Error; err == nil {
 		for _, job := range jobs {
 			// Fully offloaded torrents live only in S3 — never re-add them to
 			// the client, or it would re-download every evicted byte.
@@ -248,13 +254,8 @@ func Init() error {
 				t, err := client.AddMagnet(job.MagnetURI)
 				if err == nil {
 					Manager.InjectTrackers(t)
-					if job.Status == "paused" {
-						t.DisallowDataDownload()
-						go Manager.ApplyFilePriorities(t, job.SelectedFiles, job.SaveDirectory)
-					} else {
-						t.AllowDataDownload()
-						go Manager.ApplyFilePriorities(t, job.SelectedFiles, job.SaveDirectory)
-					}
+					Manager.installWriteErrorHook(t)
+					Manager.resumeJobAfterRestart(t, job)
 				}
 			} else if job.TorrentPath != "" {
 				if _, err := os.Stat(job.TorrentPath); err == nil {
@@ -263,13 +264,8 @@ func Init() error {
 						t, err := client.AddTorrent(mi)
 						if err == nil {
 							Manager.InjectTrackers(t)
-							if job.Status == "paused" {
-								t.DisallowDataDownload()
-								go Manager.ApplyFilePriorities(t, job.SelectedFiles, job.SaveDirectory)
-							} else {
-								t.AllowDataDownload()
-								go Manager.ApplyFilePriorities(t, job.SelectedFiles, job.SaveDirectory)
-							}
+							Manager.installWriteErrorHook(t)
+							Manager.resumeJobAfterRestart(t, job)
 						}
 					}
 				}
@@ -521,6 +517,7 @@ func (m *TorrentManager) AddMagnet(uri string, saveDir string, selectFiles bool,
 	}
 
 	m.InjectTrackers(t)
+	m.installWriteErrorHook(t)
 	infoHash := t.InfoHash().HexString()
 
 	if saveDir == "" {
@@ -593,6 +590,7 @@ func (m *TorrentManager) AddTorrentFile(torrentPath string, saveDir string, sele
 	}
 
 	m.InjectTrackers(t)
+	m.installWriteErrorHook(t)
 	infoHash := t.InfoHash().HexString()
 
 	if saveDir == "" {
@@ -651,7 +649,12 @@ func (m *TorrentManager) PauseTorrent(infoHash string) {
 	for _, t := range m.client.Torrents() {
 		if t.InfoHash().HexString() == infoHash {
 			t.DisallowDataDownload()
-			db.DB.Model(&models.TorrentJob{}).Where("info_hash = ?", infoHash).Update("status", "paused")
+			// The pause is now user-owned: clear the storage guard's flag so
+			// the guard neither skips this torrent on the next disk-full
+			// watermark (its pause branch skips jobs it owns) nor silently
+			// resumes it when its watermark recovers.
+			db.DB.Model(&models.TorrentJob{}).Where("info_hash = ?", infoHash).
+				Updates(map[string]interface{}{"status": "paused", "paused_by_guard": false})
 			break
 		}
 	}
@@ -665,7 +668,11 @@ func (m *TorrentManager) ResumeTorrent(infoHash string) {
 	for _, t := range m.client.Torrents() {
 		if t.InfoHash().HexString() == infoHash {
 			t.AllowDataDownload()
-			db.DB.Model(&models.TorrentJob{}).Where("info_hash = ?", infoHash).Update("status", "downloading")
+			// A manual resume overrides the storage guard: clear its flag so
+			// the guard can pause this torrent again on the next disk-full
+			// watermark (its pause branch skips jobs it owns).
+			db.DB.Model(&models.TorrentJob{}).Where("info_hash = ?", infoHash).
+				Updates(map[string]interface{}{"status": "downloading", "paused_by_guard": false})
 			var job models.TorrentJob
 			if err := db.DB.Where("info_hash = ?", infoHash).First(&job).Error; err == nil {
 				go m.ApplyFilePriorities(t, job.SelectedFiles, job.SaveDirectory)
@@ -673,6 +680,165 @@ func (m *TorrentManager) ResumeTorrent(infoHash string) {
 			break
 		}
 	}
+}
+
+// chunkWriteErrorThrottle bounds how often one torrent's chunk-write-error
+// hook may react. The library fires the hook on every failed chunk write, so
+// without throttling a persistently failing disk would cause a tight retry
+// loop.
+const chunkWriteErrorThrottle = 30 * time.Second
+
+// installWriteErrorHook replaces the library's default reaction to a failed
+// chunk write for one torrent. By default the library permanently disables
+// data download for the torrent — a disk-full error would leave the download
+// stopped at its current progress forever, showing a gray bar. The hook
+// instead hands the torrent back to disk admission: when the disk cannot fit
+// the remaining bytes, the torrent is parked in the FIFO queue and
+// auto-admitted once space frees up; a transient error is simply retried by
+// the library, which re-requests the failed piece on its own.
+func (m *TorrentManager) installWriteErrorHook(t *torrent.Torrent) {
+	t.SetOnWriteChunkError(func(err error) {
+		infoHash := t.InfoHash().HexString()
+		m.mu.Lock()
+		if last, seen := m.writeErrAt[infoHash]; seen && time.Since(last) < chunkWriteErrorThrottle {
+			m.mu.Unlock()
+			return
+		}
+		m.writeErrAt[infoHash] = time.Now()
+		m.mu.Unlock()
+
+		// Stream mode manages its own bounded batches and bypasses admission
+		// by design — parking one in the disk queue would hold it back for
+		// its whole remaining size. Let the library re-request the failed
+		// piece; the guard's watermark handles a genuinely full disk.
+		if streamModeGoverns(t.Length(), storageguard.LoadConfig()) {
+			return
+		}
+
+		var job models.TorrentJob
+		if err := db.DB.Where("info_hash = ?", infoHash).First(&job).Error; err != nil {
+			return // no job row (ephemeral torrent): leave retrying to the library
+		}
+		remaining := m.torrentRemainingBytes(t)
+		saveDir := job.SaveDirectory
+		if saveDir == "" {
+			saveDir = "./data/manager/downloads"
+		}
+		absSaveDir, aerr := filepath.Abs(saveDir)
+		if aerr != nil {
+			absSaveDir = saveDir
+		}
+		free, total, ok := storageguard.DiskUsage(absSaveDir)
+		if !writeErrorShouldPark(remaining, int64(free), total, ok, storageguard.LoadConfig()) {
+			return // disk still has room: transient error, the library retries
+		}
+		logger.Warn("Torrent", "Chunk write failed — parking torrent until disk space frees up",
+			"info_hash", infoHash, "error", err, "remaining", formatBytes(remaining))
+		// Mirror the admission funnel's queue path: stop requesting pieces
+		// (the disk cannot take them right now) and let the drain loop admit
+		// the torrent again once the guard frees space.
+		t.DisallowDataDownload()
+		for _, f := range t.Files() {
+			f.Cancel()
+		}
+		m.enqueueDiskQueue(infoHash)
+		db.DB.Model(&models.TorrentJob{}).
+			Where("info_hash = ? AND status = ?", infoHash, "downloading").
+			Update("status", "queued")
+	})
+}
+
+// writeErrorShouldPark decides whether a failed chunk write means the torrent
+// should be parked until disk space frees up. It never parks on a guess: an
+// unmeasurable disk leaves the retrying to the library.
+func writeErrorShouldPark(remaining, free int64, total uint64, diskOK bool, cfg models.StorageConfig) bool {
+	if !diskOK || total == 0 {
+		return false
+	}
+	return !admitDownload(remaining, 0, free, admissionReserveBytes(total, cfg))
+}
+
+// torrentRemainingBytes sums the bytes of a torrent the swarm still has to
+// deliver: per file with a non-None priority, its length minus the bytes
+// already completed. Zero before metadata is available (nothing can be
+// written before that anyway).
+func (m *TorrentManager) torrentRemainingBytes(t *torrent.Torrent) int64 {
+	var remaining int64
+	select {
+	case <-t.GotInfo():
+		for _, f := range t.Files() {
+			if f.Priority() == torrent.PiecePriorityNone {
+				continue
+			}
+			if left := f.Length() - f.BytesCompleted(); left > 0 {
+				remaining += left
+			}
+		}
+	default:
+	}
+	return remaining
+}
+
+// resumeJobAfterRestart restores a persisted job's download state after a
+// restart. User-paused jobs (status "paused" without the storage guard's
+// flag) stay paused — that is what the user asked for. Everything else
+// resumes, and in particular a job the storage guard paused
+// (paused_by_guard set) must NOT stay paused: the guard's in-memory
+// hysteresis state is lost on restart, so its resume branch can never fire
+// again and the download would sit gray at its old progress forever. The
+// guard flag is cleared instead and the job is handed to the disk-admission
+// funnel: if the disk can fit it, the download continues where it left off;
+// if not, it is parked in the FIFO queue and auto-admitted when space frees.
+func (m *TorrentManager) resumeJobAfterRestart(t *torrent.Torrent, job models.TorrentJob) {
+	if job.Status == "paused" && !job.PausedByGuard {
+		// User-paused: honor the pause across restarts.
+		t.DisallowDataDownload()
+		go m.ApplyFilePriorities(t, job.SelectedFiles, job.SaveDirectory)
+		return
+	}
+	if job.PausedByGuard {
+		// Clear the guard's ownership so it can pause this torrent again on
+		// the next disk-full watermark (its pause branch skips jobs it
+		// already owns). The admission funnel re-evaluates the disk itself.
+		db.DB.Model(&models.TorrentJob{}).Where("info_hash = ?", job.InfoHash).
+			Updates(map[string]interface{}{"paused_by_guard": false, "status": "queued"})
+	}
+	// Safe default until the admission funnel approves the download: nothing
+	// is written into a possibly still-full disk while the funnel waits for
+	// metadata or runs its pre-checks.
+	t.DisallowDataDownload()
+	go m.resumeDownload(t, job.SelectedFiles, job.SaveDirectory)
+}
+
+// resumeDownload re-runs the disk-admission funnel for a torrent and, when
+// the torrent is admitted, enables data download and normalizes a stale
+// "queued"/"error" status back to "downloading". It is the shared tail of the
+// restart-resume path and the chunk-write-error recovery path. Empty
+// selectedFilesJSON/saveDir are filled in from the stored job row.
+func (m *TorrentManager) resumeDownload(t *torrent.Torrent, selectedFilesJSON, saveDir string) {
+	infoHash := t.InfoHash().HexString()
+	if selectedFilesJSON == "" && saveDir == "" {
+		var job models.TorrentJob
+		if err := db.DB.Where("info_hash = ?", infoHash).First(&job).Error; err == nil {
+			selectedFilesJSON, saveDir = job.SelectedFiles, job.SaveDirectory
+		}
+	}
+	if !m.applyFilePriorities(t, selectedFilesJSON, saveDir) {
+		return // parked in the disk queue; the drain loop admits it later
+	}
+	// The storage guard (or the user) may have paused the torrent while the
+	// funnel was running — respect an intervening pause instead of
+	// overriding it.
+	var job models.TorrentJob
+	if err := db.DB.Where("info_hash = ?", infoHash).First(&job).Error; err == nil && job.Status == "paused" {
+		return
+	}
+	t.AllowDataDownload()
+	// A job that was waiting for disk space (or carried a stale error) is
+	// downloading again now — the stats loop never rewrites those statuses.
+	db.DB.Model(&models.TorrentJob{}).
+		Where("info_hash = ? AND status IN ?", infoHash, []string{"queued", "error"}).
+		Updates(map[string]interface{}{"status": "downloading", "error_message": ""})
 }
 
 // DeleteTorrent deletes the torrent from client, GORM, and optionally deletes actual files
@@ -689,6 +855,7 @@ func (m *TorrentManager) DeleteTorrent(infoHash string, deleteFiles bool) {
 	m.mu.Lock()
 	delete(m.skippedBytes, infoHash)
 	delete(m.applying, infoHash)
+	delete(m.writeErrAt, infoHash)
 	for i, e := range m.diskQueue {
 		if e.infoHash == infoHash {
 			m.diskQueue = append(m.diskQueue[:i], m.diskQueue[i+1:]...)

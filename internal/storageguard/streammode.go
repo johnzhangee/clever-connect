@@ -51,15 +51,15 @@ func batchIndexMap(batches [][]int) map[int]int {
 	return m
 }
 
-// batchSettled reports whether every file of a batch is secured in S3 (and
-// evicted, or eviction disabled).
-func batchSettled(b []int, rows map[int]*models.TorrentFileOffload, evictOn bool) bool {
+// batchSettled reports whether every file of a batch is secured in S3 and
+// evicted from local disk — only then does the next batch get room to run.
+func batchSettled(b []int, rows map[int]*models.TorrentFileOffload) bool {
 	for _, idx := range b {
 		row := rows[idx]
 		if row == nil || !row.Uploaded {
 			return false
 		}
-		if evictOn && !row.EvictedLocal {
+		if !row.EvictedLocal {
 			return false
 		}
 	}
@@ -113,7 +113,7 @@ func (g *Guard) applyStreamMode(cfg models.StorageConfig, job *models.TorrentJob
 
 	current := len(batches) - 1
 	for bi, b := range batches {
-		if !batchSettled(b, rows, cfg.EvictAfterUpload) {
+		if !batchSettled(b, rows) {
 			current = bi
 			break
 		}

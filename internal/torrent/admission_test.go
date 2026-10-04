@@ -51,6 +51,35 @@ func TestAdmitDownload(t *testing.T) {
 	}
 }
 
+// Write-error parking: the chunk-write-error hook parks a torrent only when
+// the disk cannot take its remaining bytes. Nothing is parked on a guess — an
+// unmeasurable disk leaves retrying to the library.
+func TestWriteErrorShouldPark(t *testing.T) {
+	const gb = int64(1024 * 1024 * 1024)
+	cfg := models.StorageConfig{AdmissionReservePercent: 10, AdmissionReserveMinGB: 5}
+
+	cases := []struct {
+		name            string
+		remaining, free int64
+		total           uint64
+		diskOK          bool
+		want            bool
+	}{
+		{"disk unmeasurable never parks", 10 * gb, 0, 100 * uint64(gb), false, false},
+		{"unknown disk size never parks", 10 * gb, 0, 0, true, false},
+		{"remaining fits comfortably", 10 * gb, 40 * gb, 100 * uint64(gb), true, false},
+		{"remaining exactly reaches reserve", 10 * gb, 20 * gb, 100 * uint64(gb), true, false},
+		{"remaining one byte over reserve", 10*gb + 1, 20 * gb, 100 * uint64(gb), true, true},
+		{"no room at all", 10 * gb, 1 * gb, 100 * uint64(gb), true, true},
+	}
+	for _, tc := range cases {
+		if got := writeErrorShouldPark(tc.remaining, tc.free, tc.total, tc.diskOK, cfg); got != tc.want {
+			t.Errorf("%s: writeErrorShouldPark(%d, %d, %d, %v) = %v; want %v",
+				tc.name, tc.remaining, tc.free, tc.total, tc.diskOK, got, tc.want)
+		}
+	}
+}
+
 func TestStreamModeGoverns(t *testing.T) {
 	const gb = int64(1024 * 1024 * 1024)
 	s3On := models.StorageConfig{S3Enabled: true, StreamThresholdGB: 12}

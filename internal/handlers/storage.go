@@ -92,7 +92,6 @@ func (h *StorageHandler) SaveConfig(c *gin.Context) {
 	updates := map[string]interface{}{
 		"s3_enabled":                incoming.S3Enabled,
 		"offload_on_completion":     incoming.OffloadOnCompletion,
-		"evict_after_upload":        incoming.EvictAfterUpload,
 		"high_watermark_percent":    high,
 		"pause_watermark_percent":   pause,
 		"stream_threshold_gb":       incoming.StreamThresholdGB,

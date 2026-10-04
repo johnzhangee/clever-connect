@@ -148,7 +148,6 @@ func defaultStorageConfig() models.StorageConfig {
 	return models.StorageConfig{
 		S3Enabled:               true,
 		OffloadOnCompletion:     true,
-		EvictAfterUpload:        true,
 		HighWatermarkPercent:    70,
 		PauseWatermarkPercent:   85,
 		StreamThresholdGB:       12,

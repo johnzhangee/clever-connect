@@ -424,10 +424,10 @@ type StorageConfig struct {
 	// Master switch for relaying completed torrent files into S3.
 	S3Enabled bool `json:"s3_enabled" gorm:"default:true"`
 	// Begin uploading every torrent file to S3 immediately as it completes.
+	// The OffloadOnCompletion switch no longer gates eviction: every file
+	// confirmed in S3 has its local copy evicted unconditionally (local disk
+	// freed; streaming reads fall back to object storage).
 	OffloadOnCompletion bool `json:"offload_on_completion" gorm:"default:true"`
-	// Delete local copies right after every file is confirmed in S3
-	// (keeps local disk usage near zero; streaming reads fall back to S3).
-	EvictAfterUpload bool `json:"evict_after_upload" gorm:"default:true"`
 	// Percentage of disk usage that triggers eviction of already-uploaded
 	// content (default 70 ⇒ offload pressure starts once free space drops
 	// below 30%).
