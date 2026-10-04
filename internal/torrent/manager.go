@@ -15,6 +15,7 @@ import (
 	"clever-connect/internal/filecore"
 	"clever-connect/internal/logger"
 	"clever-connect/internal/models"
+	"clever-connect/internal/s3torrent"
 	"clever-connect/internal/storageguard"
 
 	"github.com/anacrolix/torrent"
@@ -71,6 +72,11 @@ type TorrentManager struct {
 	// infoHash -> a funnel application is in flight for this torrent
 	// (drain-loop dedup so the queue head is not nudged twice at once).
 	applying map[string]bool
+
+	// Direct-to-S3 storage dispatcher (s3torrent): routes hashes whose piece
+	// data lives in object storage. nil in unit tests that build managers
+	// directly.
+	directS3Client *s3torrent.Client
 }
 
 var Manager *TorrentManager
@@ -88,6 +94,7 @@ func Init() error {
 		&models.TorrentConfig{},
 		&models.StorageConfig{},
 		&models.TorrentFileOffload{},
+		&models.TorrentS3Upload{},
 		&models.StorageLog{},
 	); err != nil {
 		return fmt.Errorf("failed to migrate torrent DB tables: %w", err)
@@ -180,6 +187,11 @@ func Init() error {
 	cfg.UploadRateLimiter = uploadLimiter
 	cfg.DownloadRateLimiter = downloadLimiter
 
+	// Route storage through the direct-to-S3 dispatcher: torrents registered
+	// with it write their pieces into object storage; everything else falls
+	// through to the same on-disk storage the client would use by default.
+	dispatch := installDirectS3Storage(cfg, saveDir)
+
 	client, err := torrent.NewClient(cfg)
 	if err != nil {
 		return fmt.Errorf("failed to create torrent client: %w", err)
@@ -196,6 +208,10 @@ func Init() error {
 		uploadLimiter:   uploadLimiter,
 		downloadLimiter: downloadLimiter,
 		applying:        make(map[string]bool),
+		directS3Client:  dispatch,
+	}
+	if dispatch != nil {
+		dispatch.SetFinalizeNotifier(Manager.onDirectS3Finalized)
 	}
 
 	// Reload all existing torrent jobs from database
@@ -208,7 +224,12 @@ func Init() error {
 			// filecore S3 pipeline are in the same boat — unless the storage
 			// guard still has an upload or restore in flight, in which case
 			// the torrent resumes in a normal state.
-			if job.OffloadStatus == "offloaded" ||
+			// Direct-S3 torrents always re-attach: their data lives in the
+			// s3torrent storage backend, so attaching costs no local disk
+			// and keeps streaming/seeding from S3 working.
+			if job.DirectS3 {
+				Manager.routeDirectS3(job.InfoHash)
+			} else if job.OffloadStatus == "offloaded" ||
 				(job.Status == "completed" && job.OffloadStatus == "") {
 				continue
 			}
@@ -445,7 +466,7 @@ func (m *TorrentManager) updateStats(persistDB bool) {
 					// a retryable scheduler job only on failure. The in-memory
 					// registeredFiles map guards against duplicate submissions
 					// within a session.
-					if filecore.IsS3Enabled() {
+					if filecore.IsS3Enabled() && !m.isDirectS3(infoHash) {
 						for _, f := range t.Files() {
 							if f.Length() > 0 && f.BytesCompleted() >= f.Length() {
 								fileKey := infoHash + ":" + f.Path()
@@ -468,8 +489,23 @@ func (m *TorrentManager) updateStats(persistDB bool) {
 
 // AddMagnet adds a torrent via magnet link
 func (m *TorrentManager) AddMagnet(uri string, saveDir string, selectFiles bool) (string, error) {
+	// Route direct-S3 BEFORE the torrent enters the client: storage is opened
+	// as soon as metadata resolves, which may race the add call.
+	magnetHash, useDirectS3 := "", false
+	if directS3Enabled() {
+		if magnet, perr := metainfo.ParseMagnetUri(uri); perr == nil {
+			magnetHash = magnet.InfoHash.HexString()
+			if magnetHash != "" {
+				useDirectS3 = true
+				m.routeDirectS3(magnetHash)
+			}
+		}
+	}
 	t, err := m.client.AddMagnet(uri)
 	if err != nil {
+		if useDirectS3 {
+			m.unrouteDirectS3(magnetHash)
+		}
 		return "", err
 	}
 
@@ -496,6 +532,7 @@ func (m *TorrentManager) AddMagnet(uri string, saveDir string, selectFiles bool)
 		MagnetURI:     uri,
 		SaveDirectory: saveDir,
 		Status:        status,
+		DirectS3:      useDirectS3,
 		CreatedAt:     time.Now(),
 		UpdatedAt:     time.Now(),
 	}
@@ -525,8 +562,21 @@ func (m *TorrentManager) AddTorrentFile(torrentPath string, saveDir string, sele
 		return "", err
 	}
 
+	// Route direct-S3 before the torrent enters the client (see AddMagnet).
+	fileHash, useDirectS3 := "", false
+	if directS3Enabled() {
+		fileHash = mi.HashInfoBytes().HexString()
+		useDirectS3 = fileHash != ""
+		if useDirectS3 {
+			m.routeDirectS3(fileHash)
+		}
+	}
+
 	t, err := m.client.AddTorrent(mi)
 	if err != nil {
+		if useDirectS3 {
+			m.unrouteDirectS3(fileHash)
+		}
 		return "", err
 	}
 
@@ -559,6 +609,7 @@ func (m *TorrentManager) AddTorrentFile(torrentPath string, saveDir string, sele
 		TorrentPath:   persistentPath,
 		SaveDirectory: saveDir,
 		Status:        status,
+		DirectS3:      useDirectS3,
 		CreatedAt:     time.Now(),
 		UpdatedAt:     time.Now(),
 	}
@@ -635,6 +686,15 @@ func (m *TorrentManager) DeleteTorrent(infoHash string, deleteFiles bool) {
 
 	var job models.TorrentJob
 	if err := db.DB.Where("info_hash = ?", infoHash).First(&job).Error; err == nil {
+		// Direct-S3 torrents live in object storage: stop routing and purge
+		// the S3 objects (multipart parts, staged parts, data object) on
+		// demand.
+		if job.DirectS3 {
+			m.unrouteDirectS3(infoHash)
+			if deleteFiles {
+				s3torrent.AbortTorrentUploads(infoHash, true)
+			}
+		}
 		if deleteFiles {
 			// Delete downloaded files/directory if existing
 			dataDir := job.SaveDirectory
@@ -870,6 +930,12 @@ func (m *TorrentManager) onTorrentCompleted(t *torrent.Torrent, infoHash, saveDi
 		delete(m.completing, infoHash)
 		m.mu.Unlock()
 	}()
+
+	// Direct-S3 torrents commit through the s3torrent backend (its finalize
+	// notifier updates the job); the file-based archiver has nothing to do.
+	if m.isDirectS3(infoHash) {
+		return
+	}
 
 	// Wait for metadata to resolve.
 	select {

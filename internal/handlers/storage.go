@@ -103,6 +103,7 @@ func (h *StorageHandler) SaveConfig(c *gin.Context) {
 		"admission_enabled":         incoming.AdmissionEnabled,
 		"admission_reserve_percent": incoming.AdmissionReservePercent,
 		"admission_reserve_min_gb":  incoming.AdmissionReserveMinGB,
+		"direct_s3_enabled":         incoming.DirectS3Enabled,
 	}
 	if err := db.DB.Model(&models.StorageConfig{}).Where("id = ?", current.ID).
 		Updates(updates).Error; err != nil {

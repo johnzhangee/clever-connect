@@ -84,6 +84,9 @@ func (m *TorrentManager) inflightRemainingBytes(excludeHash string) int64 {
 		if t.InfoHash().HexString() == excludeHash {
 			continue
 		}
+		if m.isDirectS3(t.InfoHash().HexString()) {
+			continue // its outstanding bytes go to S3, not the local disk
+		}
 		select {
 		case <-t.GotInfo():
 		default:
@@ -113,6 +116,10 @@ func (m *TorrentManager) inflightRemainingBytes(excludeHash string) int64 {
 // Otherwise the space math decides.
 func (m *TorrentManager) needsAdmission(infoHash, absSaveDir string, totalLength, needed int64) bool {
 	if needed <= 0 {
+		return false
+	}
+	// Direct-S3 torrents write to object storage, never to the local disk.
+	if m.isDirectS3(infoHash) {
 		return false
 	}
 	cfg := storageguard.LoadConfig()

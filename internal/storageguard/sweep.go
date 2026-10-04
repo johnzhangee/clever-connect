@@ -101,6 +101,9 @@ func (g *Guard) sweep() {
 		if job.RestoreStatus == "restoring" {
 			continue // user is pulling this one back; never race disk space
 		}
+		if job.DirectS3 {
+			continue // data lives straight in S3 — nothing to offload or evict
+		}
 		g.processTorrent(cfg, pressure, &job, t)
 	}
 
