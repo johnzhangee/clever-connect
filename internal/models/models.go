@@ -172,15 +172,20 @@ type TorrentJob struct {
 	// OffloadStatus: "" (no offload), "uploading" (S3 upload in progress),
 	// "uploaded" (fully uploaded, files still local), "offloaded" (uploaded and
 	// local copies removed), "failed" (last upload attempt failed), "restoring"
-	RestoreStatus  string    `json:"restore_status" gorm:"default:''"` // "", "restoring", "restored"
-	StreamMode     bool      `json:"stream_mode" gorm:"default:false"`
-	OffloadStatus  string    `json:"offload_status" gorm:"default:''"`
-	OffloadedFiles int       `json:"offloaded_files" gorm:"default:0"` // number of files secured in S3
-	OffloadedBytes int64     `json:"offloaded_bytes" gorm:"default:0"`
-	UploadSpeedS3  float64   `json:"upload_speed_s3"` // MB/s to Cellar/S3
-	PausedByGuard  bool      `json:"paused_by_guard" gorm:"default:false"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	RestoreStatus  string  `json:"restore_status" gorm:"default:''"` // "", "restoring", "restored"
+	StreamMode     bool    `json:"stream_mode" gorm:"default:false"`
+	OffloadStatus  string  `json:"offload_status" gorm:"default:''"`
+	OffloadedFiles int     `json:"offloaded_files" gorm:"default:0"` // number of files secured in S3
+	OffloadedBytes int64   `json:"offloaded_bytes" gorm:"default:0"`
+	UploadSpeedS3  float64 `json:"upload_speed_s3"` // MB/s to Cellar/S3
+	PausedByGuard  bool    `json:"paused_by_guard" gorm:"default:false"`
+	// DirectS3: piece data is written straight to object storage by the
+	// s3torrent backend — the torrent has no local file footprint. Set at
+	// add time when the DirectS3Enabled flag is on; drives the storage,
+	// admission, archiving and handler bypasses for this torrent.
+	DirectS3  bool      `json:"direct_s3" gorm:"default:false"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // TelegramConfig stores the Telegram bot configuration, persisted in the database.
@@ -441,6 +446,12 @@ type StorageConfig struct {
 	S3Prefix string `json:"s3_prefix" gorm:"default:'clever-connect/'"`
 	// Stop seeding torrents that were offloaded to S3 (local data is gone).
 	StopSeedingOnOffload bool `json:"stop_seeding_on_offload" gorm:"default:true"`
+	// Direct-to-S3 torrent mode: piece data of newly added torrents is
+	// written straight into object storage (hash-verified multipart parts,
+	// RAM-buffered), keeping zero torrent bytes on the container disk.
+	// Only affects torrents added while the flag is on; existing torrents
+	// keep the storage mode they were added with.
+	DirectS3Enabled bool `json:"direct_s3_enabled" gorm:"default:false"`
 }
 
 // TorrentFileOffload is the per-file ledger of torrent data secured in S3.
@@ -460,6 +471,27 @@ type TorrentFileOffload struct {
 	EvictedAt    *time.Time `json:"evicted_at"`
 	CreatedAt    time.Time  `json:"created_at"`
 	UpdatedAt    time.Time  `json:"updated_at"`
+}
+
+// TorrentS3Upload persists the direct-to-S3 multipart upload state of one
+// torrent. It is the resume anchor of the s3torrent backend: after a restart
+// the backend recreates its part layout from this row and probes which part
+// objects already exist in the bucket, so already-stored pieces are reported
+// complete to the torrent client and never re-downloaded. It is also what
+// delete-with-data uses to abort in-flight uploads and remove every object.
+type TorrentS3Upload struct {
+	InfoHash      string     `gorm:"primaryKey;type:varchar(40)" json:"info_hash"`
+	ObjectKey     string     `gorm:"type:varchar(512)" json:"object_key"`   // final assembled object
+	PartsPrefix   string     `gorm:"type:varchar(512)" json:"parts_prefix"` // staging prefix of part objects
+	UploadID      string     `gorm:"type:varchar(256)" json:"upload_id"`    // in-flight multipart upload ("" once finalized)
+	TotalLength   int64      `json:"total_length"`                          // torrent size in bytes
+	PieceLength   int64      `json:"piece_length"`                          // torrent piece length in bytes
+	PartSize      int64      `json:"part_size"`                             // S3 part granularity in bytes
+	UploadedParts string     `gorm:"type:text" json:"uploaded_parts"`       // JSON array of part indexes already stored as objects
+	Finalized     bool       `json:"finalized" gorm:"default:false"`
+	FinalizedAt   *time.Time `json:"finalized_at"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
 }
 
 // StorageLog records important storage guard events for the admin panel.
