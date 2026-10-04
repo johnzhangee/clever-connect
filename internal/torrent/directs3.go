@@ -3,10 +3,13 @@ package torrent
 // directs3.go — wiring between the torrent manager and the direct-to-S3
 // storage backend (internal/s3torrent).
 //
-// Torrents added while the StorageConfig.DirectS3Enabled flag is on are
-// routed through the s3torrent dispatching storage: their piece data is
-// written straight into object storage as hash-verified multipart parts and
-// no torrent byte ever lands on the local disk. Such torrents therefore
+// The StorageConfig.DirectS3Enabled flag (on by default; enabled once for
+// pre-existing configurations by storageguard.Init) routes torrents through
+// the s3torrent dispatching storage: their piece data is written straight
+// into object storage as hash-verified multipart parts and no torrent byte
+// ever lands on the local disk. Resumed jobs still in flight are migrated to
+// the backend as well, and a routed hash never falls back to disk storage —
+// a failed S3 open fails the torrent instead. Such torrents therefore
 // bypass the machinery that only makes sense for a local file footprint:
 //
 //   - disk admission control (admission.go) — their bytes never hit disk;
@@ -50,6 +53,21 @@ func installDirectS3Storage(cfg *torrent.ClientConfig, saveDir string) *s3torren
 // through the direct-to-S3 backend.
 func directS3Enabled() bool {
 	return storageguard.LoadConfig().DirectS3Enabled && s3store.Enabled()
+}
+
+// shouldMigrateToDirectS3 reports whether a job persisted with the legacy
+// on-disk storage should be switched to the direct-to-S3 backend when it is
+// resumed. Finished or already-offloaded jobs keep their mode; everything
+// that would otherwise continue to occupy the small instance disk is
+// migrated when direct mode is enabled.
+func shouldMigrateToDirectS3(job *models.TorrentJob, directEnabled bool) bool {
+	if !directEnabled || job.DirectS3 {
+		return false
+	}
+	if job.OffloadStatus == "offloaded" {
+		return false
+	}
+	return !(job.Status == "completed" && job.OffloadStatus == "")
 }
 
 // isDirectS3 reports whether the torrent is served by the direct-to-S3

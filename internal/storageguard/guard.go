@@ -113,6 +113,20 @@ func Init() {
 			logEvent("info", "init", fmt.Sprintf(
 				"Tightened pause watermark to %d%%", cfg.PauseWatermarkPercent))
 		}
+		// One-time rollout of direct-to-S3 torrent storage: rows created
+		// before the feature shipped carry the zero-value default (off),
+		// which was never an admin decision. Enable it once and remember it
+		// with the marker, so a later explicit opt-out survives restarts.
+		// The flag is inert while no S3 backend is configured.
+		if !cfg.DirectS3Initialized {
+			db.DB.Model(&models.StorageConfig{}).Where("id = ?", cfg.ID).
+				Updates(map[string]interface{}{
+					"direct_s3_enabled":     true,
+					"direct_s3_initialized": true,
+				})
+			logEvent("info", "init", "Enabled direct-to-S3 torrent storage (rollout default) — "+
+				"torrent pieces now stream into object storage instead of the local disk")
+		}
 	}
 }
 
@@ -145,6 +159,8 @@ func defaultStorageConfig() models.StorageConfig {
 		AdmissionEnabled:        true,
 		AdmissionReservePercent: 10,
 		AdmissionReserveMinGB:   5,
+		DirectS3Enabled:         true,
+		DirectS3Initialized:     true,
 	}
 }
 

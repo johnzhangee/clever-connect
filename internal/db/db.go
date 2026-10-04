@@ -171,6 +171,10 @@ func InitDB(cfg *config.Config) *gorm.DB {
 		&models.RcloneUpload{},
 		&models.RcloneFile{},
 		&models.RcloneSystem{},
+		// Storage guard tables: storageguard.Init runs before the torrent
+		// manager (which also migrates these) and needs them at boot.
+		&models.StorageConfig{},
+		&models.StorageLog{},
 	); err != nil {
 		logger.Fatal("DB", "Auto migration failed", "error", err)
 	}

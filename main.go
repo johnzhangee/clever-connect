@@ -100,15 +100,18 @@ func main() {
 	// Initialize Downloader Engine on server only
 	if cfg.AppMode == "server" {
 		downloader.Init()
+		// Seed/migrate the storage config BEFORE the torrent manager: the
+		// direct-to-S3 rollout default must be in effect when the manager
+		// decides which storage backend each resumed torrent uses.
+		storageguard.Init()
 		if err := torrent.Init(); err != nil {
 			logger.Error("Torrent", "Failed to initialize torrent manager", "error", err)
 		} else {
 			defer torrent.Manager.Close()
 
-			// Seed the smart storage config and start the Storage Guard
-			// (torrent offloading to the Clever Cellar S3 bucket with disk
-			// watermarks, stream batches, eviction and restore support).
-			storageguard.Init()
+			// Start the Storage Guard (torrent offloading to the Clever
+			// Cellar S3 bucket with disk watermarks, stream batches,
+			// eviction and restore support).
 			storageguard.Start(torrent.Manager)
 		}
 

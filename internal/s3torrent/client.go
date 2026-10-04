@@ -3,6 +3,7 @@ package s3torrent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 
 	"clever-connect/internal/logger"
@@ -93,23 +94,29 @@ func (c *Client) notifyFinalize(infoHash string) {
 
 // OpenTorrent implements storage.ClientImpl: routed hashes open the
 // direct-to-S3 store, everything else uses the fallback storage.
+//
+// A routed hash NEVER falls back to the fallback (disk) storage: silently
+// handing the torrent to local storage would refill the small instance disk
+// — the exact failure direct mode exists to prevent. A failed S3 open fails
+// the torrent instead (the client surfaces the error; re-adding resumes).
 func (c *Client) OpenTorrent(ctx context.Context, info *metainfo.Info, infoHash metainfo.Hash) (storage.TorrentImpl, error) {
-	if c != nil {
-		hex := infoHash.HexString()
-		if c.Has(hex) {
-			ts, err := openTorrentStore(c, info, hex)
-			if err == nil {
-				return ts.torrentImpl(), nil
-			}
-			logger.Error("S3Torrent", "Direct-to-S3 open failed — falling back to local file storage",
-				"info_hash", hex, "error", err)
-		}
-		if c.fallback != nil {
-			return c.fallback.OpenTorrent(ctx, info, infoHash)
-		}
-		return storage.TorrentImpl{}, errors.New("s3torrent: no fallback storage configured")
+	if c == nil {
+		return storage.TorrentImpl{}, errors.New("s3torrent: nil dispatch client")
 	}
-	return storage.TorrentImpl{}, errors.New("s3torrent: nil dispatch client")
+	hex := infoHash.HexString()
+	if c.Has(hex) {
+		ts, err := openTorrentStore(c, info, hex)
+		if err != nil {
+			logger.Error("S3Torrent", "Direct-to-S3 open failed — refusing disk fallback, torrent errors out",
+				"info_hash", hex, "error", err)
+			return storage.TorrentImpl{}, fmt.Errorf("s3torrent: direct-to-S3 open failed for %s: %w", hex, err)
+		}
+		return ts.torrentImpl(), nil
+	}
+	if c.fallback != nil {
+		return c.fallback.OpenTorrent(ctx, info, infoHash)
+	}
+	return storage.TorrentImpl{}, errors.New("s3torrent: no fallback storage configured")
 }
 
 var _ storage.ClientImpl = (*Client)(nil)

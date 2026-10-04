@@ -232,6 +232,17 @@ func Init() error {
 			} else if job.OffloadStatus == "offloaded" ||
 				(job.Status == "completed" && job.OffloadStatus == "") {
 				continue
+			} else if shouldMigrateToDirectS3(&job, directS3Enabled()) {
+				// The tiny instance disk must not hold torrent bytes: switch
+				// in-flight legacy jobs to the direct-to-S3 backend. Any
+				// local footprint (if it survived) is orphaned and removable;
+				// all piece data now streams into object storage.
+				Manager.routeDirectS3(job.InfoHash)
+				db.DB.Model(&models.TorrentJob{}).Where("info_hash = ?", job.InfoHash).
+					Update("direct_s3", true)
+				job.DirectS3 = true
+				logger.Info("Torrent", "Migrated in-flight torrent to direct-to-S3 storage",
+					"info_hash", job.InfoHash, "status", job.Status)
 			}
 			if job.MagnetURI != "" {
 				t, err := client.AddMagnet(job.MagnetURI)

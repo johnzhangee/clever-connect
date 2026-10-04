@@ -449,9 +449,16 @@ type StorageConfig struct {
 	// Direct-to-S3 torrent mode: piece data of newly added torrents is
 	// written straight into object storage (hash-verified multipart parts,
 	// RAM-buffered), keeping zero torrent bytes on the container disk.
-	// Only affects torrents added while the flag is on; existing torrents
-	// keep the storage mode they were added with.
-	DirectS3Enabled bool `json:"direct_s3_enabled" gorm:"default:false"`
+	// Defaults to ON: the instance disk is tiny, so downloads must stream
+	// into S3 instead of staging on it — a full local download can overflow
+	// the disk and crash the container. Only affects torrents added while
+	// the flag is on; in-flight legacy jobs are migrated at resume.
+	DirectS3Enabled bool `json:"direct_s3_enabled" gorm:"default:true"`
+	// DirectS3Initialized records that the one-time rollout default has been
+	// applied to this row by storageguard.Init (rows created before the
+	// feature shipped carry DirectS3Enabled=false as a zero value, not as an
+	// admin decision). Internal only; never shown or set via the API.
+	DirectS3Initialized bool `json:"-" gorm:"default:false"`
 }
 
 // TorrentFileOffload is the per-file ledger of torrent data secured in S3.
