@@ -386,11 +386,11 @@ func (h *TelegramHandler) SendFile(c *gin.Context) {
 	job, err := scheduler.Engine.SubmitJob(
 		"telegram_upload",
 		fmt.Sprintf("Telegram Upload: %s", filepath.Base(req.FilePath)),
-		fmt.Sprintf("Parallel upload of %s to Telegram", req.FilePath),
+		fmt.Sprintf("Upload of %s to Telegram", req.FilePath),
 		"files", // category
 		5,       // priority
 		string(payloadBytes),
-		"",      // cronExpr
+		"", // cronExpr
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to queue upload job in scheduler: " + err.Error()})

@@ -6,7 +6,7 @@ export interface TorrentJob {
   magnet_uri: string;
   torrent_path: string;
   save_directory: string;
-  status: 'downloading' | 'paused' | 'completed' | 'seeding' | 'error';
+  status: 'downloading' | 'paused' | 'queued' | 'completed' | 'seeding' | 'error';
   total_bytes: number;
   downloaded: number;
   uploaded: number;

@@ -46,7 +46,7 @@ type TelegramUploadPayload struct {
 	InfoHash string `json:"info_hash,omitempty"`
 }
 
-// uploadProgress tracks the multi-connection upload progress and throttles Telegram updates.
+// uploadProgress tracks the upload progress and throttles Telegram updates.
 type uploadProgress struct {
 	job         *models.SchedulerJob
 	eng         *Engine
@@ -54,7 +54,6 @@ type uploadProgress struct {
 	fileName    string
 	startTime   time.Time
 	lastUpdate  time.Time
-	threads     int
 	logFn       func(level, message string)
 
 	// gotd message update support
@@ -102,7 +101,8 @@ func (p *uploadProgress) Chunk(ctx context.Context, state uploader.ProgressState
 	return nil
 }
 
-// RunTelegramUploadJob executes a parallel multi-connection file upload to Telegram.
+// RunTelegramUploadJob executes a standard sequential file upload to Telegram
+// over the engine's primary MTProto connection.
 func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn func(level, message string)) error {
 	logFn("INFO", "Telegram upload job started")
 
@@ -276,9 +276,6 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 		logFn("INFO", fmt.Sprintf("Uploading playable remux: %s (size %s)", fileName, formatFileSize(info.Size())))
 	}
 
-	// Use dynamic thread count based on file size (devgagantools-style)
-	threads := calculateOptimalThreads(info.Size())
-
 	// Initialize uploader progress tracker
 	progressTracker := &uploadProgress{
 		job:         job,
@@ -287,15 +284,14 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 		fileName:    fileName,
 		startTime:   time.Now(),
 		lastUpdate:  time.Now(),
-		threads:     threads,
 		logFn:       logFn,
 		gotdClient:  eng.currentClient(),
 		gotdPeer:    peer,
 		gotdMsgID:   pMsgID,
 	}
 
-	logFn("INFO", fmt.Sprintf("Uploading file with %d parallel threads...", threads))
-	inputFile, err := FastUploadFile(eng.gotdCtx, eng.currentClient(), safePath, progressTracker)
+	logFn("INFO", "Uploading file sequentially over the primary MTProto connection...")
+	inputFile, err := UploadFile(eng.gotdCtx, eng.currentClient(), safePath, progressTracker)
 	if err != nil {
 		return fmt.Errorf("file upload failed: %w", err)
 	}

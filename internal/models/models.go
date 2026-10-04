@@ -183,9 +183,16 @@ type TorrentJob struct {
 	// s3torrent backend — the torrent has no local file footprint. Set at
 	// add time when the DirectS3Enabled flag is on; drives the storage,
 	// admission, archiving and handler bypasses for this torrent.
-	DirectS3  bool      `json:"direct_s3" gorm:"default:false"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	DirectS3 bool `json:"direct_s3" gorm:"default:false"`
+	// SendToTelegram: per-torrent opt-in from the Add Torrent modal checkbox.
+	// When set, every file of this torrent is queued for a telegram_upload job
+	// as soon as it is archived to S3 — the upload streams the authoritative
+	// S3 copy (MaterializeForUploadWithTorrent), so the file is delivered to
+	// Telegram directly from object storage. Gated in chainTelegramUpload /
+	// chainTelegramUploadDirect so every pipeline path honours it.
+	SendToTelegram bool      `json:"send_to_telegram" gorm:"default:false"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 // TelegramConfig stores the Telegram bot configuration, persisted in the database.
@@ -597,11 +604,11 @@ type RcloneFile struct {
 	// PathHash is a stable SHA-256 of Path: together with RemoteID it forms
 	// the unique identity of one provider object (long varchar paths cannot
 	// be unique-indexed safely on MySQL utf8mb4).
-	PathHash string `gorm:"type:varchar(64);uniqueIndex:idx_rclone_files_remote_path" json:"path_hash"`
-	Name     string `gorm:"type:varchar(512)" json:"name"`
-	IsDir    bool   `gorm:"default:false" json:"is_dir"`
-	Size     int64  `json:"size"`
-	MimeType string `gorm:"type:varchar(191)" json:"mime_type"`
+	PathHash string     `gorm:"type:varchar(64);uniqueIndex:idx_rclone_files_remote_path" json:"path_hash"`
+	Name     string     `gorm:"type:varchar(512)" json:"name"`
+	IsDir    bool       `gorm:"default:false" json:"is_dir"`
+	Size     int64      `json:"size"`
+	MimeType string     `gorm:"type:varchar(191)" json:"mime_type"`
 	ModTime  *time.Time `json:"mod_time"`
 	// ProviderFileID is the backend's native object/document ID from lsjson.
 	ProviderFileID string `gorm:"type:varchar(512)" json:"provider_file_id"`

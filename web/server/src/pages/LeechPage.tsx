@@ -1094,7 +1094,7 @@ export const LeechPage: React.FC = () => {
 										Auto-Upload to Telegram
 									</span>
 									<span style={{ fontSize: 10, color: 'var(--color-brand-muted)' }}>
-										Automatically queue parallel upload to Telegram when a leech job finishes
+										Automatically queue Telegram upload when a leech job finishes
 									</span>
 								</div>
 								

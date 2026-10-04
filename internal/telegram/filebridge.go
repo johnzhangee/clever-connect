@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"mime"
 	"os"
 	"path/filepath"
@@ -211,12 +210,14 @@ func (e *Engine) sendFileToChat(c tele.Context, filePath string) error {
 			formatFileSize(info.Size()), maxSizeMB))
 	}
 
-	// Telegram standard Bot API limit is 50MB. If file is larger, upload via MTProto parallel uploader.
+	// Telegram standard Bot API limit is 50MB. If file is larger, queue the
+	// standard MTProto upload job (sequential upload over the primary
+	// connection).
 	if info.Size() > 50*1024*1024 {
 		if QueueUploadJob != nil {
 			err := QueueUploadJob(filePath, c.Chat().ID)
 			if err != nil {
-				return c.Send("❌ Failed to queue parallel upload: " + err.Error())
+				return c.Send("❌ Failed to queue upload: " + err.Error())
 			}
 			return nil // The job handles progress/completion notifications
 		}
@@ -402,78 +403,8 @@ func calculateOptimalThreads(fileSize int64) int {
 	}
 }
 
-// calculateUploadThreads is a slightly more aggressive thread count for uploads,
-// since uploads are more tolerant of parallel connections than downloads.
-func calculateUploadThreads(fileSize int64) int {
-	const (
-		MB100 = 100 * 1024 * 1024
-		MB500 = 500 * 1024 * 1024
-		GB1   = 1024 * 1024 * 1024
-		GB2   = 2 * GB1
-	)
-
-	switch {
-	case fileSize < MB100:
-		return 1
-	case fileSize < MB500:
-		return 4
-	case fileSize < GB1:
-		return 8
-	case fileSize < GB2:
-		return 12
-	default:
-		threads := int(math.Ceil(float64(fileSize) / float64(MB100)))
-		if threads > 16 {
-			threads = 16
-		}
-		return threads
-	}
-}
-
-// uploadPools caches one multi-connection upload invoker per MTProto client.
-// Uploads always target the session's home DC, so a single pool per client is
-// enough; it is reused across upload jobs instead of paying the pool setup
-// cost (N TCP + MTProto handshakes) on every upload.
-//
-// The pool is bound to the client's lifetime context, so it shuts down with
-// the engine. Keying by the client *instance* is critical: the engine can be
-// restarted dynamically (StopEngine → StartEngine creates a brand-new
-// *telegram.Client), and the old client's pools die with it. Serving a dead
-// pool to the new engine makes every upload fail instantly with
-// "acquire connection: DC closed: context canceled" — a new client must get a
-// fresh pool.
-var uploadPools sync.Map // map[*telegram.Client]telegram.CloseInvoker
-
-// uploadPoolMu serializes upload pool creation.
-var uploadPoolMu sync.Mutex
-
-// getUploadPoolInvoker returns the client's cached home-DC upload pool,
-// creating it on first use.
-func getUploadPoolInvoker(client *telegram.Client) (telegram.CloseInvoker, error) {
-	uploadPoolMu.Lock()
-	defer uploadPoolMu.Unlock()
-
-	if v, ok := uploadPools.Load(client); ok {
-		return v.(telegram.CloseInvoker), nil
-	}
-	invoker, err := client.Pool(downloadPoolMaxConns)
-	if err != nil {
-		return nil, err
-	}
-	uploadPools.Store(client, invoker)
-	return invoker, nil
-}
-
-// resetUploadPool drops the client's cached upload pool after it went bad, so
-// the next upload gets fresh connections. The old pool is intentionally not
-// closed (pool.Close would cancel any concurrent upload's in-flight
-// requests); it dies with the engine's context instead.
-func resetUploadPool(client *telegram.Client) {
-	uploadPools.Delete(client)
-}
-
 // isPoolFailure reports whether err indicates a dead or stale connection
-// pool (as opposed to an ordinary upload error). gotd surfaces these
+// pool (as opposed to an ordinary download error). gotd surfaces these
 // differently depending on where the pool broke:
 //   - "invoke pool: …"                — the request died inside the pool
 //   - "acquire connection: DC closed" — the pool's context is dead (e.g. its
@@ -493,86 +424,57 @@ func isPoolFailure(err error) bool {
 		strings.Contains(msg, "engine forcibly closed")
 }
 
-// FastUploadFile uploads a file using concurrent goroutines via the gotd MTProto uploader.
-// It automatically calculates optimal threads based on file size.
-// The progress parameter is optional — pass nil to skip progress tracking.
+// UploadFile uploads a file to Telegram the standard way: sequentially, one
+// 512KB part at a time, over the engine's single primary MTProto connection.
+// There is deliberately no parallel multi-connection uploader here — parallel
+// connections and upload pools caused constant pool/DC failures, so uploads
+// use plain gotd uploader semantics with threads fixed at 1.
 //
-// Robustness: every part request transparently retries transient transport
-// failures (broken pipes, dead connections, restarted engines) on fresh
-// connections, re-resolving the live engine's client on every attempt. A
-// dead connection pool is evicted and rebuilt mid-flight, and as a last
-// resort the whole upload is retried over the primary connection. Large
-// files must never fail permanently just because a connection blipped.
-func FastUploadFile(ctx context.Context, client *telegram.Client, filePath string, progress uploader.Progress) (tg.InputFileClass, error) {
+// Robustness: each upload.saveBigFilePart request (an idempotent RPC)
+// transparently retries transient transport failures (broken pipes, dead
+// connections, restarted engines) on a fresh connection, re-resolving the
+// live engine's client on every attempt — upload file IDs are session-scoped,
+// not client-scoped, so an engine restart mid-upload does not lose progress.
+// Larger failures (e.g. a long engine outage) surface to the caller and the
+// scheduler retries the whole job.
+//
+// The progress parameter is optional — pass nil to skip progress tracking.
+func UploadFile(ctx context.Context, client *telegram.Client, filePath string, progress uploader.Progress) (tg.InputFileClass, error) {
 	info, err := os.Stat(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("file not found: %w", err)
 	}
 
-	threads := calculateUploadThreads(info.Size())
-
-	logger.Info("Telegram", "Starting fast parallel upload",
+	logger.Info("Telegram", "Starting standard sequential upload",
 		"file", filepath.Base(filePath),
 		"size", formatFileSize(info.Size()),
-		"threads", threads,
 	)
 
-	runUpload := func(invoker tg.Invoker) (tg.InputFileClass, error) {
-		up := uploader.NewUploader(tg.NewClient(invoker)).
-			WithThreads(threads).
-			WithPartSize(512 * 1024) // 512KB chunks — maximum for speed
-
-		if progress != nil {
-			up = up.WithProgress(progress)
-		}
-
-		return up.FromPath(ctx, filePath)
-	}
-
-	// Every part request retries transient transport failures on fresh
-	// connections. The invoker re-resolves the live engine's client on every
-	// attempt, so an engine (or client) restart mid-upload switches to the
-	// new client without losing progress — upload file IDs are
-	// session-scoped, not client-scoped. A single dead connection therefore
-	// no longer aborts the whole multi-thread upload.
+	// Per-part transient retries over the primary connection. The invoker
+	// re-resolves the live engine's client on every attempt, so an engine
+	// (or client) restart mid-upload switches to the new client without
+	// losing progress.
 	uploadInvoker := newRetryingInvoker("upload",
-		func() (tg.Invoker, error) {
-			c := liveClient(client)
-			pool, err := getUploadPoolInvoker(c)
-			if err != nil {
-				// The pool cannot be built right now (e.g. the client is
-				// mid-restart) — the primary connection always exists.
-				return c, nil
-			}
-			return pool, nil
-		},
-		// The pool died outright (not just one of its connections): evict
-		// it so the next attempt builds a fresh pool.
-		func(error) {
-			if c := liveClient(client); c != nil {
-				resetUploadPool(c)
-			}
-		},
+		func() (tg.Invoker, error) { return liveClient(client), nil },
+		nil,
 	)
 
-	inputFile, err := runUpload(uploadInvoker)
+	up := uploader.NewUploader(tg.NewClient(uploadInvoker)).
+		WithThreads(1).          // explicitly sequential — no parallel connections
+		WithPartSize(512 * 1024) // 512KB parts — Telegram's maximum
 
-	// Safety net for persistent pool misbehavior that per-request retries
-	// could not ride out: one full attempt over the primary connection
-	// (slower, but always available).
-	if err != nil && isPoolFailure(err) {
-		logger.Warn("Telegram", "Upload pool failed, falling back to the primary connection", "error", err)
-		inputFile, err = runUpload(newRetryingInvoker("upload-primary",
-			func() (tg.Invoker, error) { return liveClient(client), nil }, nil))
+	if progress != nil {
+		up = up.WithProgress(progress)
 	}
 
+	inputFile, err := up.FromPath(ctx, filePath)
 	if err != nil {
-		return nil, fmt.Errorf("parallel upload failed: %w", err)
+		return nil, fmt.Errorf("upload failed: %w", err)
 	}
 
-	logger.Info("Telegram", "Fast parallel upload completed",
+	logger.Info("Telegram", "Upload completed",
 		"file", filepath.Base(filePath),
-		"threads", threads,
+		"size", formatFileSize(info.Size()),
 	)
 
 	return inputFile, nil
@@ -682,7 +584,7 @@ func FastDownloadFile(ctx context.Context, client *telegram.Client, dcID int, fi
 	// Build the API client over the file's DC pool. Pools are cached per DC,
 	// so the (expensive) connection + auth transfer only happens once. Every
 	// part request transparently retries transient transport failures on
-	// fresh connections (see FastUploadFile) — the invoker re-resolves the
+	// fresh connections (see UploadFile) — the invoker re-resolves the
 	// live engine's client and its DC pool on every attempt, and a pool that
 	// died outright is evicted so the next attempt rebuilds it.
 	newDownloadAPI := func(dc int) *tg.Client {

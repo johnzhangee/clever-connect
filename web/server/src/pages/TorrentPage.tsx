@@ -8,6 +8,22 @@ import {
 } from 'react-icons/fi';
 import { showGlobalAlert } from '../store/dialogStore';
 
+// mergeTorrentFiles appends newly picked .torrent files to the current
+// selection, skipping duplicates (same name, size and timestamp) so repeated
+// picks or drops never enqueue the same file twice.
+const mergeTorrentFiles = (current: File[], incoming: File[]): File[] => {
+	const seen = new Set(current.map((f) => `${f.name}:${f.size}:${f.lastModified}`));
+	const merged = [...current];
+	for (const file of incoming) {
+		const key = `${file.name}:${file.size}:${file.lastModified}`;
+		if (!seen.has(key)) {
+			seen.add(key);
+			merged.push(file);
+		}
+	}
+	return merged;
+};
+
 interface TorrentJob {
 	info_hash: string;
 	name: string;
@@ -235,7 +251,10 @@ export const TorrentPage: React.FC = () => {
 
 	const [showAddModal, setShowAddModal] = useState(false);
 	const [magnetUri, setMagnetUri] = useState('');
-	const [torrentFile, setTorrentFile] = useState<File | null>(null);
+	// Batch add: every selected .torrent file is accepted and added to the
+	// download queue one by one on submit.
+	const [addTorrentFiles, setAddTorrentFiles] = useState<File[]>([]);
+	const [addProgress, setAddProgress] = useState({ current: 0, total: 0 });
 	const [saveDir, setSaveDir] = useState('./data/manager/downloads');
 	const [showConfigModal, setShowConfigModal] = useState(false);
 	const [folderPickerTarget, setFolderPickerTarget] = useState<'add' | 'settings'>('add');
@@ -278,7 +297,11 @@ export const TorrentPage: React.FC = () => {
 	const [selectedModalFileIndices, setSelectedModalFileIndices] = useState<number[]>([]);
 	const [fileSearchQuery, setFileSearchQuery] = useState('');
 	const [selectFilesEnabled, setSelectFilesEnabled] = useState(false);
+	const [sendToTelegram, setSendToTelegram] = useState(false);
 	const magnetsCount = magnetUri.split(/[\r\n]+/).map(m => m.trim()).filter(Boolean).length;
+	// Bulk add: multiple magnet links or multiple .torrent files share one
+	// policy — per-torrent file selection is skipped and default settings are used.
+	const isBulkAdd = magnetsCount > 1 || addTorrentFiles.length > 1;
 
 	const fetchConfig = async () => {
 		try {
@@ -415,6 +438,7 @@ export const TorrentPage: React.FC = () => {
 		setSelectedModalFileIndices([]);
 		setFileSearchQuery('');
 		setSelectFilesEnabled(false);
+		setSendToTelegram(false);
 		setShowAddModal(false);
 	};
 
@@ -425,6 +449,19 @@ export const TorrentPage: React.FC = () => {
 		setSelectedModalFileIndices([]);
 		setFileSearchQuery('');
 		setSelectFilesEnabled(false);
+		setSendToTelegram(false);
+		setShowAddModal(false);
+	};
+
+	// resetAddForm clears the add form (files, magnets, progress) and closes
+	// the modal after a successful or fully attempted add.
+	const resetAddForm = () => {
+		setAddStep('input');
+		setAddTorrentFiles([]);
+		setMagnetUri('');
+		setSelectFilesEnabled(false);
+		setSendToTelegram(false);
+		setAddProgress({ current: 0, total: 0 });
 		setShowAddModal(false);
 	};
 
@@ -454,49 +491,92 @@ export const TorrentPage: React.FC = () => {
 			setSelectedModalFileIndices([]);
 			setFileSearchQuery('');
 			setSelectFilesEnabled(false);
+			setSendToTelegram(false);
 			setShowAddModal(false);
 		}
 	};
 
 	const handleAddTorrent = async (e: React.FormEvent) => {
 		e.preventDefault();
-		if (!torrentFile && !magnetUri.trim()) return;
+		if (addTorrentFiles.length === 0 && !magnetUri.trim()) return;
 
 		const magnets = magnetUri.split(/[\r\n]+/).map(m => m.trim()).filter(Boolean);
 
 		setAddStep('submitting');
 		try {
-			if (torrentFile) {
-				const formData = new FormData();
-				formData.append('file', torrentFile);
-				formData.append('save_directory', saveDir);
-				formData.append('select_files', selectFilesEnabled ? 'true' : 'false');
-				const res = await fetch('/api/torrent/add', {
-					method: 'POST',
-					headers: { 'Authorization': `Bearer ${token}` },
-					body: formData
-				});
-				if (res && res.ok) {
-					const data = await res.json();
-					if (data.info_hash) {
-						if (selectFilesEnabled) {
-							setAddedInfoHash(data.info_hash);
-							setAddStep('fetching_metadata');
+			if (addTorrentFiles.length > 0) {
+				if (addTorrentFiles.length === 1) {
+					// Single file: unchanged flow — per-torrent file
+					// selection is still available.
+					const formData = new FormData();
+					formData.append('file', addTorrentFiles[0]);
+					formData.append('save_directory', saveDir);
+					formData.append('select_files', selectFilesEnabled ? 'true' : 'false');
+					formData.append('send_to_telegram', sendToTelegram ? 'true' : 'false');
+					const res = await fetch('/api/torrent/add', {
+						method: 'POST',
+						headers: { 'Authorization': `Bearer ${token}` },
+						body: formData
+					});
+					if (res && res.ok) {
+						const data = await res.json();
+						if (data.info_hash) {
+							if (selectFilesEnabled) {
+								setAddedInfoHash(data.info_hash);
+								setAddStep('fetching_metadata');
+							} else {
+								resetAddForm();
+							}
 						} else {
 							setAddStep('input');
-							setTorrentFile(null);
-							setMagnetUri('');
-							setSelectFilesEnabled(false);
-							setShowAddModal(false);
+							showGlobalAlert('Failed to add torrent: info hash missing', { title: 'Add Torrent Failed', variant: 'error' });
 						}
 					} else {
+						const data = res ? await res.json() : {};
 						setAddStep('input');
-						showGlobalAlert('Failed to add torrent: info hash missing', { title: 'Add Torrent Failed', variant: 'error' });
+						showGlobalAlert(data.error || 'Failed to add torrent', { title: 'Add Torrent Failed', variant: 'error' });
 					}
 				} else {
-					const data = res ? await res.json() : {};
-					setAddStep('input');
-					showGlobalAlert(data.error || 'Failed to add torrent', { title: 'Add Torrent Failed', variant: 'error' });
+					// Multiple files: accept them all and add each one by one
+					// with default settings — per-torrent file selection is
+					// skipped in bulk (same policy as multiple magnet links).
+					const failures: string[] = [];
+					let added = 0;
+					setAddProgress({ current: 0, total: addTorrentFiles.length });
+					for (let i = 0; i < addTorrentFiles.length; i++) {
+						setAddProgress({ current: i + 1, total: addTorrentFiles.length });
+						const torrentFile = addTorrentFiles[i];
+						const formData = new FormData();
+						formData.append('file', torrentFile);
+						formData.append('save_directory', saveDir);
+						formData.append('select_files', 'false');
+						formData.append('send_to_telegram', sendToTelegram ? 'true' : 'false');
+						try {
+							const res = await fetch('/api/torrent/add', {
+								method: 'POST',
+								headers: { 'Authorization': `Bearer ${token}` },
+								body: formData
+							});
+							if (res && res.ok) {
+								added++;
+							} else {
+								const data = res ? await res.json().catch(() => ({})) : {};
+								console.error(`Failed to add torrent file: ${torrentFile.name}`, data.error);
+								failures.push(`${torrentFile.name}: ${data.error || 'unknown error'}`);
+							}
+						} catch (err) {
+							console.error(`Failed to add torrent file: ${torrentFile.name}`, err);
+							failures.push(`${torrentFile.name}: network error`);
+						}
+					}
+					if (failures.length === 0) {
+						showGlobalAlert(`Added ${added} torrent${added === 1 ? '' : 's'} for download`, { title: 'Bulk Add Complete', variant: 'success' });
+					} else {
+						const listed = failures.slice(0, 3).join(', ');
+						const suffix = failures.length > 3 ? ` +${failures.length - 3} more` : '';
+						showGlobalAlert(`Added ${added} of ${addTorrentFiles.length} torrents. Failed: ${listed}${suffix}`, { title: 'Bulk Add Finished With Errors', variant: 'warning' });
+					}
+					resetAddForm();
 				}
 			} else {
 				const isBulk = magnets.length > 1;
@@ -514,7 +594,8 @@ export const TorrentPage: React.FC = () => {
 						body: JSON.stringify({
 							magnet_uri: magnet,
 							save_directory: saveDir,
-							select_files: selectFiles
+							select_files: selectFiles,
+							send_to_telegram: sendToTelegram
 						})
 					});
 
@@ -527,11 +608,7 @@ export const TorrentPage: React.FC = () => {
 									setAddStep('fetching_metadata');
 									return;
 								} else {
-									setAddStep('input');
-									setTorrentFile(null);
-									setMagnetUri('');
-									setSelectFilesEnabled(false);
-									setShowAddModal(false);
+									resetAddForm();
 								}
 							} else {
 								setAddStep('input');
@@ -551,11 +628,7 @@ export const TorrentPage: React.FC = () => {
 				}
 
 				if (isBulk) {
-					setAddStep('input');
-					setTorrentFile(null);
-					setMagnetUri('');
-					setSelectFilesEnabled(false);
-					setShowAddModal(false);
+					resetAddForm();
 				}
 			}
 		} catch (err) {
@@ -956,14 +1029,14 @@ export const TorrentPage: React.FC = () => {
 										<textarea 
 											placeholder="magnet:?xt=urn:btih:...&#10;magnet:?xt=urn:btih:..." 
 											value={magnetUri} 
-											onChange={(e) => { setMagnetUri(e.target.value); setTorrentFile(null); }}
+											onChange={(e) => { setMagnetUri(e.target.value); setAddTorrentFiles([]); }}
 											rows={3}
 											style={{ width: '100%', padding: '10px 12px 10px 38px', borderRadius: 8, border: '1px solid var(--color-brand-border)', background: 'transparent', color: 'inherit', resize: 'vertical', fontFamily: 'monospace', fontSize: 12 }}
 										/>
 									</div>
 								</div>
 
-								{magnetsCount > 1 && (
+								{isBulkAdd && (
 									<div style={{ 
 										background: 'rgba(245,158,11,0.1)', 
 										border: '1px solid rgba(245,158,11,0.2)', 
@@ -992,9 +1065,9 @@ export const TorrentPage: React.FC = () => {
 										onDragOver={(e) => e.preventDefault()}
 										onDrop={(e) => {
 											e.preventDefault();
-											const file = e.dataTransfer.files?.[0];
-											if (file && file.name.endsWith('.torrent')) {
-												setTorrentFile(file);
+											const dropped = Array.from(e.dataTransfer.files || []).filter((f) => f.name.toLowerCase().endsWith('.torrent'));
+											if (dropped.length > 0) {
+												setAddTorrentFiles((prev) => mergeTorrentFiles(prev, dropped));
 												setMagnetUri('');
 											}
 										}}
@@ -1004,8 +1077,8 @@ export const TorrentPage: React.FC = () => {
 											padding: '24px 16px',
 											textAlign: 'center',
 											cursor: 'pointer',
-											background: torrentFile ? 'rgba(234, 88, 12, 0.05)' : 'rgba(0,0,0,0.18)',
-											borderColor: torrentFile ? '#ea580c' : 'var(--color-brand-border)',
+											background: addTorrentFiles.length > 0 ? 'rgba(234, 88, 12, 0.05)' : 'rgba(0,0,0,0.18)',
+											borderColor: addTorrentFiles.length > 0 ? '#ea580c' : 'var(--color-brand-border)',
 											transition: 'all 0.2s ease',
 											display: 'flex',
 											flexDirection: 'column',
@@ -1018,17 +1091,49 @@ export const TorrentPage: React.FC = () => {
 											id="torrent-file-input"
 											type="file" 
 											accept=".torrent"
-											onChange={(e) => { if (e.target.files?.[0]) { setTorrentFile(e.target.files[0]); setMagnetUri(''); } }}
+											multiple
+											onChange={(e) => {
+												const picked = Array.from(e.target.files || []).filter((f) => f.name.toLowerCase().endsWith('.torrent'));
+												if (picked.length > 0) {
+													setAddTorrentFiles((prev) => mergeTorrentFiles(prev, picked));
+													setMagnetUri('');
+												}
+												e.target.value = '';
+											}}
 											style={{ display: 'none' }}
 										/>
-										<FiDownloadCloud size={28} style={{ color: torrentFile ? '#ea580c' : 'var(--color-brand-muted)' }} />
+										<FiDownloadCloud size={28} style={{ color: addTorrentFiles.length > 0 ? '#ea580c' : 'var(--color-brand-muted)' }} />
 										<span style={{ fontSize: 13, fontWeight: 500, color: 'var(--color-brand-heading)' }}>
-											{torrentFile ? torrentFile.name : 'Drag & Drop .torrent file here or click to browse'}
+											{addTorrentFiles.length === 0
+												? 'Drag & Drop .torrent files here or click to browse (multi-select supported)'
+												: addTorrentFiles.length === 1
+													? addTorrentFiles[0].name
+													: `${addTorrentFiles.length} .torrent files selected`}
 										</span>
-										{torrentFile && (
+										{addTorrentFiles.length > 0 && (
 											<span style={{ fontSize: 11, color: 'var(--color-brand-muted)' }}>
-												{(torrentFile.size / 1024).toFixed(1)} KB • Click to change
+												{(addTorrentFiles.reduce((sum, f) => sum + f.size, 0) / 1024).toFixed(1)} KB total • Click to add more
 											</span>
+										)}
+										{addTorrentFiles.length > 1 && (
+											<div style={{ maxHeight: 96, overflowY: 'auto', width: '100%', display: 'flex', flexDirection: 'column', gap: 2, padding: '0 16px' }}>
+												{addTorrentFiles.map((file, index) => (
+													<div key={`${file.name}:${file.size}:${file.lastModified}`} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, fontSize: 11, color: 'var(--color-brand-heading)', background: 'rgba(0,0,0,0.18)', borderRadius: 6, padding: '3px 8px' }}>
+														<span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{file.name}</span>
+														<button
+															type="button"
+															title="Remove"
+															onClick={(e) => {
+																e.stopPropagation();
+																setAddTorrentFiles((prev) => prev.filter((_, idx) => idx !== index));
+															}}
+															style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--color-brand-muted)', display: 'flex', alignItems: 'center', padding: 2, flexShrink: 0 }}
+														>
+															<FiX size={12} />
+														</button>
+													</div>
+												))}
+											</div>
 										)}
 									</div>
 								</div>
@@ -1059,41 +1164,79 @@ export const TorrentPage: React.FC = () => {
 									borderRadius: 12, 
 									border: '1px solid var(--color-brand-border)',
 									marginBottom: 24,
-									opacity: magnetsCount > 1 ? 0.5 : 1,
-									pointerEvents: magnetsCount > 1 ? 'none' : 'auto'
+									opacity: isBulkAdd ? 0.5 : 1,
+									pointerEvents: isBulkAdd ? 'none' : 'auto'
 								}}>
 									<div>
 										<span style={{ display: 'block', fontSize: 13, fontWeight: 600, color: 'var(--color-brand-heading)' }}>Select files to download</span>
 										<span style={{ display: 'block', fontSize: 11, color: 'var(--color-brand-muted)', marginTop: 2 }}>
-											{magnetsCount > 1 ? 'Disabled for multiple magnet links' : 'Fetch metadata first to check/uncheck files'}
+											{magnetsCount > 1 ? 'Disabled for multiple magnet links' : addTorrentFiles.length > 1 ? 'Disabled for multiple torrent files' : 'Fetch metadata first to check/uncheck files'}
 										</span>
 									</div>
 									<label className="switch" style={{ position: 'relative', display: 'inline-block', width: 44, height: 22 }}>
 										<input 
 											type="checkbox" 
-											disabled={magnetsCount > 1}
-											checked={magnetsCount > 1 ? false : selectFilesEnabled} 
+											disabled={isBulkAdd}
+											checked={isBulkAdd ? false : selectFilesEnabled} 
 											onChange={(e) => setSelectFilesEnabled(e.target.checked)} 
 											style={{ opacity: 0, width: 0, height: 0 }} 
 										/>
 										<span style={{ 
 											position: 'absolute', cursor: 'pointer', top: 0, left: 0, right: 0, bottom: 0, 
-											backgroundColor: (magnetsCount > 1 ? false : selectFilesEnabled) ? '#ea580c' : 'rgba(255,255,255,0.1)', 
+											backgroundColor: (isBulkAdd ? false : selectFilesEnabled) ? '#ea580c' : 'rgba(255,255,255,0.1)', 
 											transition: '.3s', borderRadius: 22 
 										}}>
 											<span style={{ 
 												position: 'absolute', content: '""', height: 16, width: 16, left: 3, bottom: 3, 
 												backgroundColor: 'white', transition: '.3s', borderRadius: '50%',
-												transform: (magnetsCount > 1 ? false : selectFilesEnabled) ? 'translateX(22px)' : 'translateX(0)' 
+												transform: (isBulkAdd ? false : selectFilesEnabled) ? 'translateX(22px)' : 'translateX(0)' 
 											}} />
 										</span>
 									</label>
 								</div>
+							{/* Send to Telegram after S3 upload */}
+							<div style={{
+								display: 'flex',
+								alignItems: 'center',
+								justifyContent: 'space-between',
+								background: 'rgba(0,0,0,0.18)',
+								padding: '12px 16px',
+								borderRadius: 12,
+								border: '1px solid var(--color-brand-border)',
+								marginBottom: 24
+							}}>
+								<div>
+									<span style={{ display: 'block', fontSize: 13, fontWeight: 600, color: 'var(--color-brand-heading)' }}>Send to Telegram after S3 upload</span>
+									<span style={{ display: 'block', fontSize: 11, color: 'var(--color-brand-muted)', marginTop: 2 }}>
+										Upload each downloaded file to Telegram from S3 once it is safely archived
+									</span>
+								</div>
+								<label className="switch" style={{ position: 'relative', display: 'inline-block', width: 44, height: 22 }}>
+									<input
+										type="checkbox"
+										checked={sendToTelegram}
+										onChange={(e) => setSendToTelegram(e.target.checked)}
+										style={{ opacity: 0, width: 0, height: 0 }}
+									/>
+									<span style={{
+										position: 'absolute', cursor: 'pointer', top: 0, left: 0, right: 0, bottom: 0,
+										backgroundColor: sendToTelegram ? '#ea580c' : 'rgba(255,255,255,0.1)',
+										transition: '.3s', borderRadius: 22
+									}}>
+										<span style={{
+											position: 'absolute', content: '""', height: 16, width: 16, left: 3, bottom: 3,
+											backgroundColor: 'white', transition: '.3s', borderRadius: '50%',
+											transform: sendToTelegram ? 'translateX(22px)' : 'translateX(0)'
+										}} />
+									</span>
+								</label>
+							</div>
+
 
 								<div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12 }}>
 									<button type="button" onClick={handleCancelAdd} className="btn">Cancel</button>
-									<button type="submit" className="btn btn--primary" style={{ background: '#ea580c', borderColor: '#ea580c', color: '#fff', display: 'flex', alignItems: 'center', gap: 8 }} disabled={!magnetUri.trim() && !torrentFile}>
-										{selectFilesEnabled && magnetsCount <= 1 ? (
+									<button type="submit" className="btn btn--primary" style={{ background: '#ea580c', borderColor: '#ea580c', color: '#fff', display: 'flex', alignItems: 'center', gap: 8 }} disabled={!magnetUri.trim() && addTorrentFiles.length === 0}>
+										{selectFilesEnabled && !isBulkAdd ? (
 											<>Next <FiChevronLeft size={16} style={{ transform: 'rotate(180deg)' }} /></>
 										) : (
 											'Start Downloading'
@@ -1109,9 +1252,11 @@ export const TorrentPage: React.FC = () => {
 								<div>
 									<h4 style={{ fontSize: 15, fontWeight: 700, margin: 0, color: 'var(--color-brand-heading)' }}>Submitting to Server</h4>
 									<p style={{ fontSize: 12, color: 'var(--color-brand-muted)', marginTop: 6 }}>
-										{magnetsCount > 1 
-											? `Registering torrent jobs...` 
-											: 'Uploading torrent payload and registering job metadata...'
+										{addTorrentFiles.length > 1
+											? `Adding torrent ${addProgress.current} of ${addProgress.total}...`
+											: magnetsCount > 1 
+												? `Registering torrent jobs...` 
+												: 'Uploading torrent payload and registering job metadata...'
 										}
 									</p>
 								</div>

@@ -141,7 +141,7 @@ func (e *Engine) registerCommands() {
 			}
 		}
 
-		// Fetch active uploads (telegram parallel uploads)
+		// Fetch active uploads (telegram upload jobs)
 		var activeUploads []models.SchedulerJob
 		if err := db.DB.Where("job_type = ? AND status = ?", "telegram_upload", "running").Find(&activeUploads).Error; err == nil && len(activeUploads) > 0 {
 			stats += "\n\n📤 *Active Uploads:*"

@@ -279,8 +279,8 @@ func TestIsPoolFailure(t *testing.T) {
 	// The exact error shapes gotd produces when a connection pool is dead or
 	// stale (e.g. its owning client was closed after an engine restart).
 	poolFailures := []string{
-		// Observed in production logs: stale cached upload pool.
-		"parallel upload failed: upload part: send upload part 0 RPC: acquire connection: DC closed: context canceled",
+		// Observed in production logs: stale cached connection pool.
+		"acquire connection: DC closed: context canceled",
 		"acquire connection: DC closed: context deadline exceeded",
 		"upload part: send upload part 3 RPC: invoke pool: engine forcibly closed",
 		"invoke pool: write: connection reset by peer",
@@ -297,7 +297,7 @@ func TestIsPoolFailure(t *testing.T) {
 	// Ordinary errors (including a plain cancelled *request* context) must NOT
 	// be mistaken for pool failures — retrying those wastes a full re-upload.
 	nonPoolFailures := []string{
-		"parallel upload failed: context canceled",
+		"upload failed: context canceled",
 		"file upload failed: FLOOD_WAIT_420",
 		"open /tmp/file.bin: no such file or directory",
 		"upload part: send upload part 0 RPC: FILE_PARTS_INVALID",
@@ -319,18 +319,8 @@ func TestPoolCachesAreKeyedByClient(t *testing.T) {
 	c1 := telegram.NewClient(2040, "b18441a1ff607e10a989891a5624e0d4", telegram.Options{})
 	c2 := telegram.NewClient(2040, "b18441a1ff607e10a989891a5624e0d4", telegram.Options{})
 
-	// Upload pools: a pool stored for one client must not be served to
+	// Download pools: a pool stored for one client must not be served to
 	// another, and eviction must be isolated per client.
-	uploadPools.Store(c1, fakeInvoker{})
-	if _, ok := uploadPools.Load(c2); ok {
-		t.Fatal("upload pool cached for client #1 leaked into client #2")
-	}
-	resetUploadPool(c1)
-	if _, ok := uploadPools.Load(c1); ok {
-		t.Fatal("resetUploadPool did not evict client #1's pool")
-	}
-
-	// Download pools: same, per (client, DC) pair.
 	dcDownloadPools.Store(dcPoolKey{client: c1, dc: 4}, fakeInvoker{})
 	if _, ok := dcDownloadPools.Load(dcPoolKey{client: c2, dc: 4}); ok {
 		t.Fatal("DC pool cached for client #1 leaked into client #2")

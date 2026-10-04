@@ -499,7 +499,7 @@ func (m *TorrentManager) updateStats(persistDB bool) {
 }
 
 // AddMagnet adds a torrent via magnet link
-func (m *TorrentManager) AddMagnet(uri string, saveDir string, selectFiles bool) (string, error) {
+func (m *TorrentManager) AddMagnet(uri string, saveDir string, selectFiles bool, sendToTelegram bool) (string, error) {
 	// Route direct-S3 BEFORE the torrent enters the client: storage is opened
 	// as soon as metadata resolves, which may race the add call.
 	magnetHash, useDirectS3 := "", false
@@ -538,14 +538,15 @@ func (m *TorrentManager) AddMagnet(uri string, saveDir string, selectFiles bool)
 	}
 
 	job := models.TorrentJob{
-		InfoHash:      infoHash,
-		Name:          "Fetching metadata...",
-		MagnetURI:     uri,
-		SaveDirectory: saveDir,
-		Status:        status,
-		DirectS3:      useDirectS3,
-		CreatedAt:     time.Now(),
-		UpdatedAt:     time.Now(),
+		InfoHash:       infoHash,
+		Name:           "Fetching metadata...",
+		MagnetURI:      uri,
+		SaveDirectory:  saveDir,
+		Status:         status,
+		DirectS3:       useDirectS3,
+		SendToTelegram: sendToTelegram,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
 	}
 
 	// Save or update GORM entry
@@ -567,7 +568,7 @@ func (m *TorrentManager) AddMagnet(uri string, saveDir string, selectFiles bool)
 }
 
 // AddTorrentFile adds a torrent via physical .torrent file
-func (m *TorrentManager) AddTorrentFile(torrentPath string, saveDir string, selectFiles bool) (string, error) {
+func (m *TorrentManager) AddTorrentFile(torrentPath string, saveDir string, selectFiles bool, sendToTelegram bool) (string, error) {
 	mi, err := metainfo.LoadFromFile(torrentPath)
 	if err != nil {
 		return "", err
@@ -615,14 +616,15 @@ func (m *TorrentManager) AddTorrentFile(torrentPath string, saveDir string, sele
 	}
 
 	job := models.TorrentJob{
-		InfoHash:      infoHash,
-		Name:          t.Name(),
-		TorrentPath:   persistentPath,
-		SaveDirectory: saveDir,
-		Status:        status,
-		DirectS3:      useDirectS3,
-		CreatedAt:     time.Now(),
-		UpdatedAt:     time.Now(),
+		InfoHash:       infoHash,
+		Name:           t.Name(),
+		TorrentPath:    persistentPath,
+		SaveDirectory:  saveDir,
+		Status:         status,
+		DirectS3:       useDirectS3,
+		SendToTelegram: sendToTelegram,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
 	}
 
 	if err := db.DB.Save(&job).Error; err != nil {

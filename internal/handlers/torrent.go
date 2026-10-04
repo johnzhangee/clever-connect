@@ -2,7 +2,9 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,6 +21,10 @@ import (
 
 type TorrentHandler struct {
 	cfg *config.Config
+	// addTorrentFile is the torrent.Manager.AddTorrentFile seam; nil in
+	// production (the fallback defers to the manager) and stubbed by tests so
+	// the multi-file add loop runs without a live torrent client.
+	addTorrentFile func(path, saveDir string, selectFiles, sendToTelegram bool) (string, error)
 }
 
 func NewTorrentHandler(cfg *config.Config) *TorrentHandler {
@@ -144,13 +150,14 @@ func (h *TorrentHandler) AddTorrent(c *gin.Context) {
 
 	// 1. Check for Magnet link first
 	var input struct {
-		MagnetURI     string `json:"magnet_uri"`
-		SaveDirectory string `json:"save_directory"`
-		SelectFiles   bool   `json:"select_files"`
+		MagnetURI      string `json:"magnet_uri"`
+		SaveDirectory  string `json:"save_directory"`
+		SelectFiles    bool   `json:"select_files"`
+		SendToTelegram bool   `json:"send_to_telegram"`
 	}
 
 	if err := c.ShouldBind(&input); err == nil && input.MagnetURI != "" {
-		infoHash, err := torrent.Manager.AddMagnet(input.MagnetURI, input.SaveDirectory, input.SelectFiles)
+		infoHash, err := torrent.Manager.AddMagnet(input.MagnetURI, input.SaveDirectory, input.SelectFiles, input.SendToTelegram)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add magnet link", "details": err.Error()})
 			return
@@ -159,35 +166,78 @@ func (h *TorrentHandler) AddTorrent(c *gin.Context) {
 		return
 	}
 
-	// 2. Check for File Upload (.torrent)
-	file, err := c.FormFile("file")
-	if err == nil {
+	// 2. Check for File Upload (.torrent) — one file or a whole batch posted
+	// under the same "file" form field. Every file is processed and added one
+	// by one: a single-file request keeps the original response shape, while
+	// a batch returns a per-file result list and never aborts on the first
+	// failure.
+	files := uploadedTorrentFiles(c)
+	if len(files) > 0 {
 		saveDir := c.PostForm("save_directory")
-		selectFilesVal := c.PostForm("select_files")
-		selectFiles := selectFilesVal == "true"
-		
+		selectFiles := c.PostForm("select_files") == "true"
+		sendToTelegram := c.PostForm("send_to_telegram") == "true"
+
 		// Ensure temporary folder exists
 		tempDir := "./data/manager/temp"
 		_ = os.MkdirAll(tempDir, 0755)
 
-		tempPath := filepath.Join(tempDir, file.Filename)
-		if err := c.SaveUploadedFile(file, tempPath); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save uploaded file", "details": err.Error()})
-			return
-		}
-		defer os.Remove(tempPath)
-
-		infoHash, err := torrent.Manager.AddTorrentFile(tempPath, saveDir, selectFiles)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load torrent metadata", "details": err.Error()})
+		if len(files) == 1 {
+			infoHash, err := saveAndAddUploadedTorrent(c, files[0], tempDir, saveDir, selectFiles, sendToTelegram, h.addTorrentFile)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process uploaded torrent file", "details": err.Error()})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"status": "added", "info_hash": infoHash})
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{"status": "added", "info_hash": infoHash})
+		results := make([]gin.H, 0, len(files))
+		for _, file := range files {
+			infoHash, err := saveAndAddUploadedTorrent(c, file, tempDir, saveDir, selectFiles, sendToTelegram, h.addTorrentFile)
+			if err != nil {
+				results = append(results, gin.H{"file": file.Filename, "status": "failed", "error": err.Error()})
+				continue
+			}
+			results = append(results, gin.H{"file": file.Filename, "status": "added", "info_hash": infoHash})
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "added", "results": results})
 		return
 	}
 
 	c.JSON(http.StatusBadRequest, gin.H{"error": "Please provide a magnet_uri or upload a .torrent file"})
+}
+
+// uploadedTorrentFiles returns every file posted under the "file" form field,
+// supporting multi-file uploads; nil when the request carries no file part.
+func uploadedTorrentFiles(c *gin.Context) []*multipart.FileHeader {
+	form, err := c.MultipartForm()
+	if err != nil || form == nil {
+		return nil
+	}
+	return form.File["file"]
+}
+
+// saveAndAddUploadedTorrent writes one uploaded .torrent into the temporary
+// folder, hands it to the torrent manager and removes the temporary copy, so
+// batch uploads never collide on the same temp name.
+func saveAndAddUploadedTorrent(c *gin.Context, file *multipart.FileHeader, tempDir, saveDir string, selectFiles, sendToTelegram bool, add func(path, saveDir string, selectFiles, sendToTelegram bool) (string, error)) (string, error) {
+	if add == nil {
+		add = func(path, saveDir string, selectFiles, sendToTelegram bool) (string, error) {
+			return torrent.Manager.AddTorrentFile(path, saveDir, selectFiles, sendToTelegram)
+		}
+	}
+
+	tempPath := filepath.Join(tempDir, file.Filename)
+	if err := c.SaveUploadedFile(file, tempPath); err != nil {
+		return "", fmt.Errorf("save uploaded file: %w", err)
+	}
+	defer os.Remove(tempPath)
+
+	infoHash, err := add(tempPath, saveDir, selectFiles, sendToTelegram)
+	if err != nil {
+		return "", fmt.Errorf("load torrent metadata: %w", err)
+	}
+	return infoHash, nil
 }
 
 // PauseTorrent halts piece matching for a torrent
@@ -262,10 +312,10 @@ func (h *TorrentHandler) ListTorrentFiles(c *gin.Context) {
 			select {
 			case <-t.GotInfo():
 				type fileItem struct {
-					Index      int    `json:"index"`
-					Path       string `json:"path"`
-					Length     int64  `json:"length"`
-					Completed  int64  `json:"completed"`
+					Index      int     `json:"index"`
+					Path       string  `json:"path"`
+					Length     int64   `json:"length"`
+					Completed  int64   `json:"completed"`
 					Percentage float64 `json:"percentage"`
 				}
 
@@ -400,7 +450,7 @@ func (h *TorrentHandler) SaveConfig(c *gin.Context) {
 	if torrent.Manager != nil {
 		// Try to apply speed limits dynamically without resetting connections
 		torrent.Manager.ApplyLimits(input.UploadLimitMB, input.DownloadLimitMB)
-		
+
 		// Reinitialize full engine (only if app mode is server)
 		if h.cfg.AppMode == "server" {
 			if err := torrent.Init(); err != nil {
@@ -412,4 +462,3 @@ func (h *TorrentHandler) SaveConfig(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"status": "saved"})
 }
-

@@ -130,7 +130,7 @@ func Init() {
 			_, err = Engine.SubmitJob(
 				"telegram_upload",
 				fmt.Sprintf("Upload %s", filepath.Base(filePath)),
-				fmt.Sprintf("Parallel upload of %s to Telegram", filepath.Base(filePath)),
+				fmt.Sprintf("Upload of %s to Telegram", filepath.Base(filePath)),
 				"files",
 				5,
 				string(payloadBytes),
@@ -1268,7 +1268,7 @@ func (s *Scheduler) registerBuiltinJobs() {
 		return nil
 	})
 
-	// Telegram parallel multi-connection file upload
+	// Telegram file upload (standard sequential MTProto upload)
 	s.RegisterJob("telegram_upload", func(ctx context.Context, job *models.SchedulerJob, logFn func(string, string)) error {
 		return telegram.RunTelegramUploadJob(ctx, job, logFn)
 	})
