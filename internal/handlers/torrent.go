@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"clever-connect/internal/config"
 	"clever-connect/internal/db"
@@ -25,6 +26,11 @@ type TorrentHandler struct {
 	// production (the fallback defers to the manager) and stubbed by tests so
 	// the multi-file add loop runs without a live torrent client.
 	addTorrentFile func(path, saveDir string, selectFiles, sendToTelegram bool) (string, error)
+
+	// bulkDelete guards the background delete-all loop so overlapping bulk
+	// delete requests never run concurrently.
+	bulkMu       sync.Mutex
+	bulkDeleting bool
 }
 
 func NewTorrentHandler(cfg *config.Config) *TorrentHandler {
@@ -293,6 +299,86 @@ func (h *TorrentHandler) DeleteTorrent(c *gin.Context) {
 
 	torrent.Manager.DeleteTorrent(input.InfoHash, input.DeleteFiles)
 	c.JSON(http.StatusOK, gin.H{"status": "deleted", "info_hash": input.InfoHash})
+}
+
+// DeleteTorrents deletes one, several, or every torrent job. A request with
+// delete_all — or an empty info_hashes list — targets every torrent known to
+// the database and the running client; a non-empty info_hashes list targets
+// only the selected ones. Each torrent is dropped from the torrent engine,
+// which stops its download/upload process, and its job row — plus optionally
+// its files and S3 data — is removed. The per-torrent work runs in the
+// background so the response is immediate; the jobs WebSocket stream shows
+// the list shrinking as each torrent is deleted.
+func (h *TorrentHandler) DeleteTorrents(c *gin.Context) {
+	if h.proxyToServer(c, c.Request.Method, c.Request.URL.Path) {
+		return
+	}
+
+	var input struct {
+		InfoHashes  []string `json:"info_hashes"`
+		DeleteAll   bool     `json:"delete_all"`
+		DeleteFiles bool     `json:"delete_files"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid payload", "details": err.Error()})
+		return
+	}
+
+	// Resolve the targets: an explicit selection, or every torrent in the
+	// database plus any client torrent that has no job row yet.
+	var hashes []string
+	if input.DeleteAll || len(input.InfoHashes) == 0 {
+		var jobs []models.TorrentJob
+		db.DB.Select("info_hash").Find(&jobs)
+		seen := make(map[string]struct{}, len(jobs))
+		for _, job := range jobs {
+			hashes = append(hashes, job.InfoHash)
+			seen[job.InfoHash] = struct{}{}
+		}
+		if torrent.Manager != nil {
+			for _, t := range torrent.Manager.Client().Torrents() {
+				hash := t.InfoHash().HexString()
+				if _, ok := seen[hash]; !ok {
+					hashes = append(hashes, hash)
+				}
+			}
+		}
+	} else {
+		hashes = append(hashes, input.InfoHashes...)
+	}
+
+	if len(hashes) == 0 {
+		c.JSON(http.StatusOK, gin.H{"status": "nothing_to_delete", "count": 0})
+		return
+	}
+
+	// Reject a second bulk delete while one is already running so two loops
+	// never race over the same rows and files.
+	h.bulkMu.Lock()
+	if h.bulkDeleting {
+		h.bulkMu.Unlock()
+		c.JSON(http.StatusConflict, gin.H{"error": "A bulk delete is already in progress"})
+		return
+	}
+	h.bulkDeleting = true
+	h.bulkMu.Unlock()
+
+	go func(targets []string, deleteFiles bool) {
+		defer func() {
+			h.bulkMu.Lock()
+			h.bulkDeleting = false
+			h.bulkMu.Unlock()
+		}()
+		manager := torrent.Manager
+		if manager == nil {
+			return
+		}
+		for _, hash := range targets {
+			manager.DeleteTorrent(hash, deleteFiles)
+		}
+	}(hashes, input.DeleteFiles)
+
+	c.JSON(http.StatusOK, gin.H{"status": "deleting", "count": len(hashes)})
 }
 
 // ListTorrentFiles returns file list inside a specific torrent

@@ -290,6 +290,12 @@ export const TorrentPage: React.FC = () => {
 	const [torrentToDelete, setTorrentToDelete] = useState<TorrentJob | null>(null);
 	const [deleteFilesOption, setDeleteFilesOption] = useState(false);
 
+	// Bulk selection / delete-all state
+	const [selectedTorrentHashes, setSelectedTorrentHashes] = useState<string[]>([]);
+	const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false);
+	const [bulkDeleteFilesOption, setBulkDeleteFilesOption] = useState(false);
+	const [bulkDeleting, setBulkDeleting] = useState(false);
+
 	// Add Torrent Step states
 	const [addStep, setAddStep] = useState<'input' | 'submitting' | 'fetching_metadata' | 'select_files'>('input');
 	const [addedInfoHash, setAddedInfoHash] = useState('');
@@ -302,6 +308,10 @@ export const TorrentPage: React.FC = () => {
 	// Bulk add: multiple magnet links or multiple .torrent files share one
 	// policy — per-torrent file selection is skipped and default settings are used.
 	const isBulkAdd = magnetsCount > 1 || addTorrentFiles.length > 1;
+
+	// Bulk selection derived state
+	const isAllSelected = torrents.length > 0 && selectedTorrentHashes.length === torrents.length;
+	const isSomeSelected = selectedTorrentHashes.length > 0 && !isAllSelected;
 
 	const fetchConfig = async () => {
 		try {
@@ -689,6 +699,68 @@ export const TorrentPage: React.FC = () => {
 		setDeleteFilesOption(false);
 	};
 
+	const toggleSelectTorrent = (infoHash: string) => {
+		setSelectedTorrentHashes(prev =>
+			prev.includes(infoHash) ? prev.filter(h => h !== infoHash) : [...prev, infoHash]
+		);
+	};
+
+	const toggleSelectAllTorrents = () => {
+		setSelectedTorrentHashes(prev =>
+			prev.length === torrents.length ? [] : torrents.map(t => t.info_hash)
+		);
+	};
+
+	// Keep the selection in sync with the live list: drop hashes that no
+	// longer exist so the "select all" state stays accurate.
+	useEffect(() => {
+		setSelectedTorrentHashes(prev => {
+			const existing = new Set(torrents.map(t => t.info_hash));
+			const next = prev.filter(h => existing.has(h));
+			return next.length === prev.length ? prev : next;
+		});
+	}, [torrents]);
+
+	// handleBulkDeleteConfirm sends the selection to the backend, which stops
+	// each torrent's engine process (Drop), deletes its job row and optionally
+	// its files; the live WebSocket list reflects the removals as they happen.
+	const handleBulkDeleteConfirm = async () => {
+		if (selectedTorrentHashes.length === 0) return;
+		const deleteAll = selectedTorrentHashes.length === torrents.length;
+		setBulkDeleting(true);
+		try {
+			const res = await fetch('/api/torrent/delete-all', {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json',
+					'Authorization': `Bearer ${token}`
+				},
+				body: JSON.stringify({
+					info_hashes: deleteAll ? [] : selectedTorrentHashes,
+					delete_all: deleteAll,
+					delete_files: bulkDeleteFilesOption
+				})
+			});
+			if (res.ok) {
+				const data = await res.json();
+				if ((data.count ?? 0) > 0) {
+					showGlobalAlert(`Deleting ${data.count} torrent${data.count === 1 ? '' : 's'}...`, { title: 'Delete Torrents', variant: 'info' });
+				}
+				setShowBulkDeleteModal(false);
+				setSelectedTorrentHashes([]);
+				setBulkDeleteFilesOption(false);
+			} else {
+				const data = await res.json();
+				showGlobalAlert(data.error || 'Failed to delete torrents', { title: 'Delete Torrents', variant: 'error' });
+			}
+		} catch (err) {
+			console.error(err);
+			showGlobalAlert('Failed to delete torrents', { title: 'Delete Torrents', variant: 'error' });
+		} finally {
+			setBulkDeleting(false);
+		}
+	};
+
 	const fetchTorrentFiles = async (infoHash: string) => {
 		setLoadingFiles(true);
 		try {
@@ -777,6 +849,54 @@ export const TorrentPage: React.FC = () => {
 					</button>
 				</div>
 			</div>
+
+			{/* BULK SELECTION TOOLBAR */}
+			{torrents.length > 0 && (
+				<div style={{
+					display: 'flex',
+					alignItems: 'center',
+					justifyContent: 'space-between',
+					flexWrap: 'wrap',
+					gap: 12,
+					background: 'var(--color-card-bg, #fff)',
+					border: '1px solid var(--color-brand-border, rgba(0,0,0,0.08))',
+					borderRadius: 12,
+					padding: '12px 16px',
+					marginBottom: 16
+				}}>
+					<label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', fontSize: 14, fontWeight: 600, color: 'var(--color-brand-heading)' }}>
+						<input
+							type="checkbox"
+							checked={isAllSelected}
+							ref={(el) => { if (el) el.indeterminate = isSomeSelected; }}
+							onChange={toggleSelectAllTorrents}
+							style={{ width: 16, height: 16, cursor: 'pointer' }}
+						/>
+						Select All
+					</label>
+					<div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+						<span style={{ fontSize: 13, color: 'var(--color-brand-muted)' }}>
+							{selectedTorrentHashes.length} of {torrents.length} selected
+						</span>
+						<button
+							onClick={() => setShowBulkDeleteModal(true)}
+							disabled={selectedTorrentHashes.length === 0 || bulkDeleting}
+							className="btn btn--sm"
+							style={{
+								display: 'flex',
+								alignItems: 'center',
+								gap: 8,
+								background: selectedTorrentHashes.length === 0 ? 'rgba(239, 68, 68, 0.4)' : 'rgba(239, 68, 68, 0.1)',
+								color: '#ef4444',
+								borderColor: 'rgba(239, 68, 68, 0.2)',
+								cursor: selectedTorrentHashes.length === 0 ? 'not-allowed' : 'pointer'
+							}}
+						>
+							<FiTrash2 size={13} /> Delete Selected
+						</button>
+					</div>
+				</div>
+			)}
 
 			{/* Torrent Jobs List */}
 			{torrents.length === 0 ? (
@@ -890,6 +1010,17 @@ export const TorrentPage: React.FC = () => {
 									</div>
 								)}
 								<div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12, gap: 16 }}>
+									<label
+										onClick={(e) => e.stopPropagation()}
+										style={{ display: 'flex', alignItems: 'center', flexShrink: 0, cursor: 'pointer' }}
+									>
+										<input
+											type="checkbox"
+											checked={selectedTorrentHashes.includes(t.info_hash)}
+											onChange={() => toggleSelectTorrent(t.info_hash)}
+											style={{ width: 16, height: 16, cursor: 'pointer' }}
+										/>
+									</label>
 									<div style={{ minWidth: 0 }}>
 										<h3 style={{ margin: 0, fontSize: 16, fontWeight: 600, color: 'var(--color-brand-heading)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
 											{t.name}
@@ -1491,6 +1622,54 @@ export const TorrentPage: React.FC = () => {
 						<div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12 }}>
 							<button onClick={() => setTorrentToDelete(null)} className="btn">Cancel</button>
 							<button onClick={handleDeleteConfirm} className="btn btn--primary" style={{ background: '#ef4444', borderColor: '#ef4444', color: '#fff' }}>Remove</button>
+						</div>
+					</div>
+				</div>
+			)}
+
+			{/* BULK DELETE CONFIRMATION MODAL */}
+			{showBulkDeleteModal && (
+				<div style={{
+					position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+					background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)',
+					display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1200
+				}}>
+					<div style={{
+						background: 'var(--color-card-bg, #fff)',
+						borderRadius: 16, width: '90%', maxWidth: 450, padding: 24,
+						border: '1px solid var(--color-brand-border)',
+						boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.1)'
+					}}>
+						<h3 style={{ margin: 0, fontSize: 18, fontWeight: 700, color: 'var(--color-brand-heading)', marginBottom: 12 }}>
+							Delete {selectedTorrentHashes.length} Torrent{selectedTorrentHashes.length === 1 ? '' : 's'}
+						</h3>
+						<p style={{ margin: 0, fontSize: 14, color: 'var(--color-brand-muted)', marginBottom: 20 }}>
+							{selectedTorrentHashes.length === 1 ? 'This torrent' : `These ${selectedTorrentHashes.length} torrents`} will be permanently stopped and removed from the client. The download process of each selected torrent is stopped and its database record is deleted.
+						</p>
+
+						<div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 24 }}>
+							<input
+								type="checkbox"
+								id="bulkDeleteFilesOpt"
+								checked={bulkDeleteFilesOption}
+								onChange={(e) => setBulkDeleteFilesOption(e.target.checked)}
+								style={{ width: 16, height: 16, cursor: 'pointer' }}
+							/>
+							<label htmlFor="bulkDeleteFilesOpt" style={{ fontSize: 13, fontWeight: 500, cursor: 'pointer' }}>
+								Also delete downloaded data from disk
+							</label>
+						</div>
+
+						<div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12 }}>
+							<button onClick={() => setShowBulkDeleteModal(false)} className="btn">Cancel</button>
+							<button
+								onClick={handleBulkDeleteConfirm}
+								disabled={bulkDeleting}
+								className="btn btn--primary"
+								style={{ background: '#ef4444', borderColor: '#ef4444', color: '#fff' }}
+							>
+								{bulkDeleting ? 'Deleting...' : 'Delete'}
+							</button>
 						</div>
 					</div>
 				</div>

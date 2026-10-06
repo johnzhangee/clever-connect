@@ -540,6 +540,7 @@ func main() {
 			protected.POST("/torrent/pause", torrentHandler.PauseTorrent)
 			protected.POST("/torrent/resume", torrentHandler.ResumeTorrent)
 			protected.POST("/torrent/delete", torrentHandler.DeleteTorrent)
+			protected.POST("/torrent/delete-all", torrentHandler.DeleteTorrents)
 			protected.GET("/torrent/files", torrentHandler.ListTorrentFiles)
 			protected.POST("/torrent/select-files", torrentHandler.SelectTorrentFiles)
 			protected.GET("/torrent/config", torrentHandler.GetConfig)

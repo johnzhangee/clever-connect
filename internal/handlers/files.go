@@ -227,6 +227,78 @@ func (h *FileHandler) mergeS3VirtualFiles(safeDir string, virtualFiles map[strin
 	}
 }
 
+// torrentFileRef is the minimal per-file metadata the directory listing needs
+// from an active torrent: its path inside the save directory and its length.
+type torrentFileRef struct {
+	Path   string
+	Length int64
+}
+
+// torrentSelectionFilter decodes a job's SelectedFiles JSON with the same
+// semantics as the download priority funnel (ApplyFilePriorities in the
+// torrent manager and selectedFileSet in storageguard): "" / "null" /
+// unparsable means every file is wanted; "[]" means none; otherwise only the
+// listed indices are. The indices are positions into the torrent's file list —
+// the same numbering the /api/torrent/files endpoint (and therefore the
+// selection UI) uses.
+func torrentSelectionFilter(selectedJSON string) (all bool, wanted map[int]bool) {
+	if selectedJSON == "" || selectedJSON == "null" {
+		return true, nil
+	}
+	var idx []int
+	if err := json.Unmarshal([]byte(selectedJSON), &idx); err != nil {
+		return true, nil
+	}
+	wanted = make(map[int]bool, len(idx))
+	for _, i := range idx {
+		wanted[i] = true
+	}
+	return false, wanted
+}
+
+// mergeTorrentVirtualEntries adds one active torrent's files to a directory
+// listing as virtual entries: a file whose parent is the listed directory
+// itself lands as a file entry, and the top-level folder of any deeper path is
+// surfaced so the listing stays navigable. Only wanted files are merged —
+// files the user deselected (allWanted=false, index missing from wanted) are
+// never downloaded and have no file on disk or in S3, so listing them would
+// create ghost entries with nothing behind them.
+func mergeTorrentVirtualEntries(virtualFiles map[string]FileItem, absSaveDir, safePath string, files []torrentFileRef, allWanted bool, wanted map[int]bool) {
+	for i, ref := range files {
+		if !allWanted && !wanted[i] {
+			continue
+		}
+		torrentFilePath := filepath.Clean(filepath.Join(absSaveDir, ref.Path))
+		parentDir := filepath.Dir(torrentFilePath)
+
+		if parentDir == safePath {
+			name := filepath.Base(torrentFilePath)
+			virtualFiles[name] = FileItem{
+				Name:      name,
+				IsDir:     false,
+				Size:      ref.Length,
+				ModTime:   time.Now(),
+				Extension: filepath.Ext(name),
+			}
+		} else if strings.HasPrefix(parentDir, safePath) {
+			rel, err := filepath.Rel(safePath, parentDir)
+			if err == nil && rel != "." && rel != ".." {
+				parts := strings.Split(filepath.ToSlash(rel), "/")
+				if len(parts) > 0 && parts[0] != "" {
+					dirName := parts[0]
+					virtualFiles[dirName] = FileItem{
+						Name:      dirName,
+						IsDir:     true,
+						Size:      0,
+						ModTime:   time.Now(),
+						Extension: "",
+					}
+				}
+			}
+		}
+	}
+}
+
 // ListDirectory handles GET /api/files/list
 func (h *FileHandler) ListDirectory(c *gin.Context) {
 	if h.proxyToServer(c, c.Request.Method, c.Request.URL.Path) {
@@ -292,8 +364,10 @@ func (h *FileHandler) ListDirectory(c *gin.Context) {
 		var jobs []models.TorrentJob
 		if err := db.DB.Find(&jobs).Error; err == nil {
 			jobMap := make(map[string]string)
+			selectionMap := make(map[string]string)
 			for _, job := range jobs {
 				jobMap[job.InfoHash] = job.SaveDirectory
+				selectionMap[job.InfoHash] = job.SelectedFiles
 			}
 
 			for _, t := range torrent.Manager.Client().Torrents() {
@@ -307,38 +381,23 @@ func (h *FileHandler) ListDirectory(c *gin.Context) {
 					absSaveDir = saveDir
 				}
 
+				// Respect the user's per-file selection: "" / "null" /
+				// unparsable means every file is wanted (the torrent was added
+				// without the selection feature); otherwise the JSON array
+				// lists exactly the indices the user checked (possibly none).
+				// Deselected files are never downloaded — no file exists on
+				// disk and none was archived to S3 — so listing them would
+				// create ghost entries with nothing behind them.
+				allWanted, wanted := torrentSelectionFilter(selectionMap[infoHash])
+
 				select {
 				case <-t.GotInfo():
-					for _, f := range t.Files() {
-						torrentFilePath := filepath.Clean(filepath.Join(absSaveDir, f.Path()))
-						parentDir := filepath.Dir(torrentFilePath)
-
-						if parentDir == safePath {
-							name := filepath.Base(torrentFilePath)
-							virtualFiles[name] = FileItem{
-								Name:      name,
-								IsDir:     false,
-								Size:      f.Length(),
-								ModTime:   time.Now(),
-								Extension: filepath.Ext(name),
-							}
-						} else if strings.HasPrefix(parentDir, safePath) {
-							rel, err := filepath.Rel(safePath, parentDir)
-							if err == nil && rel != "." && rel != ".." {
-								parts := strings.Split(filepath.ToSlash(rel), "/")
-								if len(parts) > 0 && parts[0] != "" {
-									dirName := parts[0]
-									virtualFiles[dirName] = FileItem{
-										Name:      dirName,
-										IsDir:     true,
-										Size:      0,
-										ModTime:   time.Now(),
-										Extension: "",
-									}
-								}
-							}
-						}
+					tfiles := t.Files()
+					refs := make([]torrentFileRef, len(tfiles))
+					for i, f := range tfiles {
+						refs[i] = torrentFileRef{Path: f.Path(), Length: f.Length()}
 					}
+					mergeTorrentVirtualEntries(virtualFiles, absSaveDir, safePath, refs, allWanted, wanted)
 				default:
 				}
 			}
