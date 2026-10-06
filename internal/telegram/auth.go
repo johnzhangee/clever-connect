@@ -160,6 +160,14 @@ func StartAuthClient(phoneNumber string, cfg *models.TelegramConfig) {
 			default:
 			}
 		}
+
+		if err == nil {
+			// Interactive User Account Verification succeeded — mirror the
+			// fresh MTProto session into the database so the account stays
+			// verified across container restarts and the engine is always
+			// ready to start without repeating verification.
+			SaveUserSessionData()
+		}
 	}()
 }
 

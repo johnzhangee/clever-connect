@@ -61,7 +61,8 @@ var transientTransportPatterns = []string{
 // isTransientTransportErr reports whether err is a transport-level failure
 // worth retrying: a dead connection, a closed pool, or a torn-down client.
 // Real RPC responses from the server (FLOOD_WAIT, AUTH_KEY_*, …) are *not*
-// transient transport errors and are never retried here.
+// transient transport errors: logic errors are never retried, while
+// FLOOD_WAIT is handled separately by the shared flood gate (see flood.go).
 func isTransientTransportErr(err error) bool {
 	if err == nil {
 		return false
@@ -100,6 +101,12 @@ func isPoolDead(err error) bool {
 // and the whole 1 GB multi-thread upload restarted from part zero" and "the
 // part was re-sent on a fresh connection half a second later".
 //
+// It also handles FLOOD_WAIT: before each attempt it awaits the shared
+// per-method flood gate, and a flood error waits out the cooldown and retries
+// without consuming the transport retry budget. Because a flood-rejected
+// request is never executed by the server, this is safe even if the wrapper
+// is (mis)used for non-idempotent requests.
+//
 // Every attempt re-resolves the underlying invoker via build(), so retries
 // always land on the healthiest available transport: the live engine's
 // current client (the self-healing supervisor may have replaced it), its
@@ -108,7 +115,8 @@ func isPoolDead(err error) bool {
 // IMPORTANT: only wrap invokers that serve idempotent RPCs
 // (upload.saveBigFilePart, upload.getFile, dialog/peer reads). Requests like
 // messages.sendMessage must never be retried here — a retried send would
-// duplicate the message.
+// duplicate the message. For sends use floodSafeInvoker, which waits out
+// FLOOD_WAIT but never retries transport errors.
 type retryInvoker struct {
 	name  string
 	build func() (tg.Invoker, error)
@@ -126,7 +134,16 @@ func newRetryingInvoker(name string, build func() (tg.Invoker, error), reset fun
 
 // Invoke implements tg.Invoker.
 func (r *retryInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
-	for attempt := 1; ; attempt++ {
+	method := floodMethodKey(input)
+	var floodWaited time.Duration
+	for attempt := 1; ; {
+		// Respect a FLOOD_WAIT cooldown raised by this or another job
+		// before sending, so concurrent transfers pause together instead
+		// of triggering fresh flood errors. A no-op unless a cooldown is
+		// active.
+		if err := awaitFloodGate(ctx, method); err != nil {
+			return err
+		}
 		var (
 			inv     tg.Invoker
 			buildEr error
@@ -143,6 +160,27 @@ func (r *retryInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin
 		}
 		if err == nil {
 			return nil
+		}
+
+		// FLOOD_WAIT / FLOOD_PREMIUM_WAIT / SLOWMODE_WAIT: Telegram
+		// rejected the request before executing it, so waiting out the
+		// cooldown and re-sending is safe for every method (unlike the
+		// transport retries below, which are limited to idempotent RPCs).
+		// The cooldown is shared through the flood gate, so concurrent
+		// transfers wait together and resume staggered. Flood waits do not
+		// consume the transport retry budget (attempt is not incremented).
+		if wait, ok := floodWaitFrom(err); ok {
+			if ctx.Err() != nil {
+				return err
+			}
+			raiseFloodGate(method, wait, r.name)
+			if floodWaited+wait > maxAutoFloodWait {
+				return fmt.Errorf(
+					"%s: Telegram flood control requires a %s wait, which exceeds the %s automatic limit: %w",
+					r.name, wait, maxAutoFloodWait, err)
+			}
+			floodWaited += wait
+			continue // loop top awaits the raised gate, then retries
 		}
 
 		// Never retry a caller-canceled request, an exhausted retry budget,
@@ -170,6 +208,7 @@ func (r *retryInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin
 			return err
 		case <-time.After(backoff):
 		}
+		attempt++
 	}
 }
 

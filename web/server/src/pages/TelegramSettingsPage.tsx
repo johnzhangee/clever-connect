@@ -145,8 +145,10 @@ export const TelegramSettingsPage: React.FC = () => {
         setPhone(loadedConfig.phone_number || '');
         setMaskedToken(data.masked_token || '');
         
-        // If config is set to user account, check if already active
-        if (loadedConfig.auth_type === 'user' && data.running) {
+        // If config is set to user account, check if already active.
+        // A persisted session also counts as verified: the account stays
+        // verified after restarts, so never force the wizard again.
+        if (loadedConfig.auth_type === 'user' && (data.running || data.user_session_exists)) {
           setAuthStep('success');
         }
         setSessionExists(!!data.user_session_exists);

@@ -116,12 +116,14 @@ func UserSessionPath() string {
 	return filepath.Join("./data/manager", ".telegram", "session.json")
 }
 
-// HasUserSession reports whether a verified MTProto user session file exists.
+// HasUserSession reports whether a verified MTProto user session is available.
 // The engine cannot start in user mode until this file has been created by the
 // interactive verification flow (phone number + login code [+ 2FA password]).
+// If the file was lost to an ephemeral-disk wipe but the account was verified
+// before, it is transparently restored from the durable database copy first —
+// once verified, the account stays verified and the engine can always start.
 func HasUserSession() bool {
-	_, err := os.Stat(UserSessionPath())
-	return err == nil
+	return ensureUserSessionFile()
 }
 
 // StartEngine boots the Telegram bot using the config stored in the database.
@@ -167,6 +169,10 @@ func StartEngine(cfg *models.TelegramConfig) error {
 	var sessionPath string
 	if cfg.AuthType == "user" {
 		sessionPath = UserSessionPath()
+		// Restore the verified session from the database copy if the
+		// ephemeral disk lost the file (container restart/redeploy) — once
+		// verified, the account stays verified and the engine can start.
+		ensureUserSessionFile()
 		// Check if session file exists
 		if _, err := os.Stat(sessionPath); os.IsNotExist(err) {
 			cancel()
@@ -279,6 +285,13 @@ func StartEngine(cfg *models.TelegramConfig) error {
 			)
 
 			clientReady.Store(true)
+
+			if cfg.AuthType == "user" {
+				// Keep the durable verification record fresh: the session can
+				// be re-keyed or migrated to another datacenter during a
+				// connect, and the database copy must always match the disk.
+				SaveUserSessionData()
+			}
 
 			// Signal success
 			select {

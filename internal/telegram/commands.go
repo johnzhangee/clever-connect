@@ -416,14 +416,14 @@ func getPeerInput(peer tg.PeerClass, entities tg.Entities) tg.InputPeerClass {
 
 func (e *Engine) sendUserMessage(ctx context.Context, entities tg.Entities, peer tg.PeerClass, text string) error {
 	inputPeer := getPeerInput(peer, entities)
-	sender := message.NewSender(tg.NewClient(e.currentClient()))
+	sender := message.NewSender(floodSafeClient("user-message", e.currentClient()))
 	htmlText := mdToHTML(text)
 	_, err := sender.To(inputPeer).StyledText(ctx, html.String(nil, htmlText))
 	return err
 }
 
 func (e *Engine) handleUserCallbackQuery(ctx context.Context, entities tg.Entities, u *tg.UpdateBotCallbackQuery) error {
-	api := tg.NewClient(e.currentClient())
+	api := floodSafeClient("user-callback", e.currentClient())
 
 	data := string(u.Data)
 	logger.Info("Telegram", "Callback received (MTProto)", "data", data, "user_id", u.UserID)
@@ -594,7 +594,7 @@ func (e *Engine) handleFileBrowseUser(ctx context.Context, entities tg.Entities,
 	kbMarkup := &tg.ReplyInlineMarkup{Rows: kbRows}
 	htmlText := mdToHTML(text)
 
-	api := tg.NewClient(e.currentClient())
+	api := floodSafeClient("user-browser", e.currentClient())
 	if messageID != 0 {
 		// Editing via the raw RPC would render the HTML tags literally (MTProto
 		// has no parse mode); the message builder parses them into entities.

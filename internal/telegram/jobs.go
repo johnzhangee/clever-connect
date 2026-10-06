@@ -95,7 +95,7 @@ func (p *uploadProgress) Chunk(ctx context.Context, state uploader.ProgressState
 				ReplyMarkup: restartJobMarkupBot(p.job.ID),
 			})
 		} else if p.gotdClient != nil && p.gotdPeer != nil && p.gotdMsgID != 0 {
-			_ = editGotdMessageHTML(ctx, tg.NewClient(liveClient(p.gotdClient)), p.gotdPeer, p.gotdMsgID, progressText, restartJobMarkupGotd(p.job.ID))
+			_ = editGotdMessageHTML(ctx, floodSafeClient("upload-progress-edit", p.gotdClient), p.gotdPeer, p.gotdMsgID, progressText, restartJobMarkupGotd(p.job.ID))
 		}
 	}
 	return nil
@@ -228,7 +228,10 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 
 	// The engine's gotdClient is already running inside client.Run().
 	// We can use the engine's gotdCtx to execute API calls directly.
-	api := tg.NewClient(eng.currentClient())
+	// The client is flood-safe: the initial send, error edits and cleanup
+	// deletes wait out FLOOD_WAIT via the shared gate instead of failing
+	// the job.
+	api := floodSafeClient("upload-messaging", eng.currentClient())
 
 	// Peer resolution is a read-only RPC — retry transient transport failures
 	// so a dead connection cannot kill the job before the upload even starts.
@@ -291,9 +294,20 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 	}
 
 	logFn("INFO", "Uploading file sequentially over the primary MTProto connection...")
-	inputFile, err := UploadFile(eng.gotdCtx, eng.currentClient(), safePath, progressTracker)
-	if err != nil {
-		return fmt.Errorf("file upload failed: %w", err)
+
+	// The upload phase is flood-tolerant: part-level FLOOD_WAITs are waited
+	// out transparently by the retrying invoker (and coordinated across all
+	// jobs through the shared gate); only a persistent flood longer than the
+	// automatic cap reaches here, where the job waits it out and restarts
+	// the upload instead of failing and burning a scheduler retry.
+	var inputFile tg.InputFileClass
+	uploadErr := runFloodTolerant(eng.gotdCtx, logFn, "file upload", floodUploadMethods, func() error {
+		var uerr error
+		inputFile, uerr = UploadFile(eng.gotdCtx, eng.currentClient(), safePath, progressTracker)
+		return uerr
+	})
+	if uploadErr != nil {
+		return fmt.Errorf("file upload failed: %w", uploadErr)
 	}
 
 	// Generate a JWT download token for the direct download button
@@ -480,28 +494,34 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 	}
 
 	// Send media post — only attach download button if URL is a valid public HTTPS link.
-	// Re-resolve the live client in case the MTProto client was replaced
-	// mid-upload by the self-healing supervisor — the fresh client must send
-	// the final media message.
-	sender := message.NewSender(tg.NewClient(liveClient(eng.currentClient())))
-
-	if strings.HasPrefix(absoluteDownloadURL, "https://") {
-		kbMarkup := &tg.ReplyInlineMarkup{
-			Rows: []tg.KeyboardButtonRow{
-				{
-					Buttons: []tg.KeyboardButtonClass{
-						&tg.KeyboardButtonURL{
-							Text: "📥 Download Direct Link",
-							URL:  absoluteDownloadURL,
+	// The send phase is flood-tolerant: a FLOOD_WAIT on the send waits out
+	// the shared cooldown and re-sends, instead of failing the job and
+	// discarding the fully uploaded file.
+	mediaSentErr = runFloodTolerant(eng.gotdCtx, logFn, "media send", floodSendMethods, func() error {
+		// Re-resolve the live client in case the MTProto client was replaced
+		// mid-upload by the self-healing supervisor — the fresh client must
+		// send the final media message. A fresh sender per attempt keeps the
+		// request builder state clean across flood retries.
+		sender := message.NewSender(floodSafeClient("upload-send", eng.currentClient()))
+		if strings.HasPrefix(absoluteDownloadURL, "https://") {
+			kbMarkup := &tg.ReplyInlineMarkup{
+				Rows: []tg.KeyboardButtonRow{
+					{
+						Buttons: []tg.KeyboardButtonClass{
+							&tg.KeyboardButtonURL{
+								Text: "📥 Download Direct Link",
+								URL:  absoluteDownloadURL,
+							},
 						},
 					},
 				},
-			},
+			}
+			_, serr := sender.To(peer).Markup(kbMarkup).Media(eng.gotdCtx, mediaOption)
+			return serr
 		}
-		_, mediaSentErr = sender.To(peer).Markup(kbMarkup).Media(eng.gotdCtx, mediaOption)
-	} else {
-		_, mediaSentErr = sender.To(peer).Media(eng.gotdCtx, mediaOption)
-	}
+		_, serr := sender.To(peer).Media(eng.gotdCtx, mediaOption)
+		return serr
+	})
 
 	if mediaSentErr != nil {
 		// Attempt to update the progress message with error
@@ -696,7 +716,9 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 		return fmt.Errorf("MTProto client is not initialized")
 	}
 
-	api := tg.NewClient(eng.currentClient())
+	// Flood-safe client: message fetches and progress/status edits wait out
+	// FLOOD_WAIT via the shared gate instead of failing the job.
+	api := floodSafeClient("download-messaging", eng.currentClient())
 
 	// Peer resolution is a read-only RPC — retry transient transport failures
 	// so a dead connection cannot kill the job before the download even starts.
@@ -870,7 +892,7 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 						},
 					},
 				}
-				sender := message.NewSender(tg.NewClient(liveClient(eng.currentClient())))
+				sender := message.NewSender(floodSafeClient("download-notify", eng.currentClient()))
 				_, _ = sender.To(peer).Markup(kbMarkup).StyledText(eng.gotdCtx, html.String(nil, successText))
 			}
 
@@ -894,7 +916,7 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 			progressMsg = msg
 		}
 	} else {
-		sender := message.NewSender(tg.NewClient(liveClient(eng.currentClient())))
+		sender := message.NewSender(floodSafeClient("download-notify", eng.currentClient()))
 		kbMarkup := restartJobMarkupGotd(job.ID)
 		msg, err := sender.To(peer).Markup(kbMarkup).StyledText(eng.gotdCtx, html.String(nil, initialText))
 		if err == nil {
@@ -921,7 +943,7 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 	lastUpdate := time.Now()
 	startTime := time.Now()
 
-	err = FastDownloadFile(eng.gotdCtx, eng.currentClient(), fileDCID, fileLocation, safePath, fileSize, func(downloaded, total int64) {
+	onProgress := func(downloaded, total int64) {
 		percent := int(100 * float64(downloaded) / float64(total))
 		if percent > 100 {
 			percent = 100
@@ -954,6 +976,14 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 				_ = editGotdMessageHTML(eng.gotdCtx, api, peer, pMsgID, progressText, restartJobMarkupGotd(job.ID))
 			}
 		}
+	}
+
+	// The download phase is flood-tolerant: part-level FLOOD_WAITs are waited
+	// out transparently by the retrying invoker; only a persistent flood
+	// longer than the automatic cap reaches here, where the job waits it out
+	// and retries instead of failing and burning a scheduler retry.
+	err = runFloodTolerant(eng.gotdCtx, logFn, "file download", floodDownloadMethods, func() error {
+		return FastDownloadFile(eng.gotdCtx, eng.currentClient(), fileDCID, fileLocation, safePath, fileSize, onProgress)
 	})
 
 	if err != nil {

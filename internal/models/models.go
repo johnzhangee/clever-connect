@@ -213,6 +213,18 @@ type TelegramConfig struct {
 	MTProtoPublicKey    string `json:"mtproto_public_key" gorm:"type:text"`
 	PhoneNumber         string `json:"phone_number"`
 	AuthType            string `json:"auth_type" gorm:"default:'bot'"` // 'bot' or 'user'
+
+	// UserSessionData is the durable copy of the verified MTProto user session
+	// (the raw contents of session.json) captured right after the interactive
+	// User Account Verification succeeds and refreshed after every successful
+	// user-engine connect. The manager disk is ephemeral — container restarts
+	// wipe the file — so the database copy is what keeps the account verified
+	// forever: on boot the file is transparently restored from here and the
+	// engine starts without repeating phone verification. Excluded from JSON
+	// because the blob contains the account's MTProto authorization keys.
+	UserSessionData string `json:"-" gorm:"type:text"`
+	// UserVerifiedAt records when interactive verification completed.
+	UserVerifiedAt *time.Time `json:"user_verified_at"`
 }
 
 // TorrentConfig stores advanced client configurations for BitTorrent client

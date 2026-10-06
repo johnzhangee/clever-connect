@@ -435,8 +435,12 @@ func isPoolFailure(err error) bool {
 // connections, restarted engines) on a fresh connection, re-resolving the
 // live engine's client on every attempt — upload file IDs are session-scoped,
 // not client-scoped, so an engine restart mid-upload does not lose progress.
-// Larger failures (e.g. a long engine outage) surface to the caller and the
-// scheduler retries the whole job.
+// It also handles FLOOD_WAIT: a rate-limited part request waits out the
+// shared, process-wide flood gate (coordinated with every other concurrent
+// upload/download) and retries the same part — progress is never lost, and
+// no job re-triggers a flood another job is already waiting out. Larger
+// failures (e.g. a very long flood or a long engine outage) surface to the
+// caller and the job/scheduler retries.
 //
 // The progress parameter is optional — pass nil to skip progress tracking.
 func UploadFile(ctx context.Context, client *telegram.Client, filePath string, progress uploader.Progress) (tg.InputFileClass, error) {

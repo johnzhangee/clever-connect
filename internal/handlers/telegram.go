@@ -191,6 +191,11 @@ func (h *TelegramHandler) SaveConfig(c *gin.Context) {
 			req.BotToken = existing.BotToken
 		}
 		req.Model = existing.Model
+		// Preserve the durable User Account Verification data: saving
+		// settings must never de-authorize a verified account or wipe the
+		// session blob the engine restores after an ephemeral-disk wipe.
+		req.UserSessionData = existing.UserSessionData
+		req.UserVerifiedAt = existing.UserVerifiedAt
 		if err := db.DB.Save(&req).Error; err != nil {
 			logger.Error("Telegram", "Failed to update Telegram config", "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save configuration"})
@@ -597,8 +602,12 @@ func (h *TelegramHandler) VerifyAuthCode(c *gin.Context) {
 	case <-telegram.GetSuccessChan():
 		var cfg models.TelegramConfig
 		_ = db.DB.First(&cfg)
-		cfg.IsActive = true
-		db.DB.Save(&cfg)
+		// Column-scoped update: a full-row Save() here would race with the
+		// auth goroutine persisting the fresh session blob to the same row.
+		db.DB.Model(&cfg).Update("is_active", true)
+		// Persist the verification data immediately (the auth goroutine also
+		// saves it) so the account stays verified across restarts.
+		telegram.SaveUserSessionData()
 
 		_ = telegram.StartEngine(&cfg)
 
@@ -645,8 +654,12 @@ func (h *TelegramHandler) VerifyAuthPassword(c *gin.Context) {
 	case <-telegram.GetSuccessChan():
 		var cfg models.TelegramConfig
 		_ = db.DB.First(&cfg)
-		cfg.IsActive = true
-		db.DB.Save(&cfg)
+		// Column-scoped update: a full-row Save() here would race with the
+		// auth goroutine persisting the fresh session blob to the same row.
+		db.DB.Model(&cfg).Update("is_active", true)
+		// Persist the verification data immediately (the auth goroutine also
+		// saves it) so the account stays verified across restarts.
+		telegram.SaveUserSessionData()
 
 		_ = telegram.StartEngine(&cfg)
 
