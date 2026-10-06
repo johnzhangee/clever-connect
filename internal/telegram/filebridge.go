@@ -425,6 +425,19 @@ func isPoolFailure(err error) bool {
 		strings.Contains(msg, "engine forcibly closed")
 }
 
+// uploadTransferConcurrency caps how many file uploads transfer in parallel
+// process-wide. The scheduler can run as many upload jobs at once as it has
+// workers (its default is the CPU count); with every job pushing up to 16
+// threads through the shared 16-connection pool, Telegram answers with a
+// constant stream of part-level FLOOD_WAITs (4,000+ in 21 minutes in one
+// incident), which slows every transfer to a crawl. A modest global cap
+// keeps the aggregate part rate within what Telegram tolerates and lets each
+// upload finish sooner instead of many of them crawling together.
+const uploadTransferConcurrency = 4
+
+// uploadSlots is the semaphore enforcing uploadTransferConcurrency.
+var uploadSlots = make(chan struct{}, uploadTransferConcurrency)
+
 // UploadFile uploads a file to Telegram using parallel multi-connection
 // transfers, mirroring the FastDownloadFile architecture: the gotd uploader
 // pushes 512KB parts with N concurrent goroutines (N from
@@ -457,6 +470,17 @@ func UploadFile(ctx context.Context, client *telegram.Client, filePath string, p
 	info, err := os.Stat(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("file not found: %w", err)
+	}
+
+	// Acquire one of the process-wide upload slots so simultaneous jobs do
+	// not flood Telegram's part-upload endpoint (see uploadTransferConcurrency).
+	// The slot is held for the whole transfer, including its internal
+	// retries, and is released on every return path.
+	select {
+	case uploadSlots <- struct{}{}:
+		defer func() { <-uploadSlots }()
+	case <-ctx.Done():
+		return nil, fmt.Errorf("upload cancelled: %w", ctx.Err())
 	}
 
 	// The upload API resolves its underlying connection per request: while

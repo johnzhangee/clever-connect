@@ -47,6 +47,51 @@ type TelegramUploadPayload struct {
 	InfoHash string `json:"info_hash,omitempty"`
 }
 
+// progressEditInterval is the minimum time between Telegram progress-message
+// edits across ALL concurrent jobs. Every running upload or download edits
+// its own progress message in the same chat, so the per-job 1.5s throttle
+// multiplies with the job count: ~15 concurrent jobs produced ~10 edits per
+// second, which Telegram answered with an escalating messaging FLOOD_WAIT
+// (27 minutes in one incident) that froze every progress display and blocked
+// the final media post of every completed upload. One process-wide edit slot
+// keeps the rate safe no matter how many jobs run at once. Package variable
+// so tests can shorten it.
+var progressEditInterval = 5 * time.Second
+
+// progressEdits is the shared progress-edit slot: one process-wide budget for
+// the cosmetic progress messages of every running transfer.
+var progressEdits struct {
+	mu   sync.Mutex
+	last time.Time
+}
+
+// claimProgressEdit reports whether a Telegram progress edit may go out now,
+// advancing the shared slot when it may. finished (the 100% update) bypasses
+// the interval so the completion state is always shown promptly.
+func claimProgressEdit(finished bool) bool {
+	progressEdits.mu.Lock()
+	defer progressEdits.mu.Unlock()
+	now := time.Now()
+	if !finished && now.Sub(progressEdits.last) < progressEditInterval {
+		return false
+	}
+	progressEdits.last = now
+	return true
+}
+
+// progressEditAllowed is the single gate every progress-edit call site must
+// pass: edits are skipped entirely (never queued) while a messaging flood
+// cooldown is active, and otherwise share the process-wide edit slot. The
+// 100% update bypasses the slot interval but never the flood check — during
+// a ban even it must wait, because sending into an active ban escalates the
+// ban that is also blocking the media post.
+func progressEditAllowed(finished bool) bool {
+	if floodGateRemaining(floodEditMethods...) > 0 {
+		return false
+	}
+	return claimProgressEdit(finished)
+}
+
 // uploadProgress tracks the upload progress and throttles Telegram updates.
 // Chunk is invoked concurrently by every upload thread, so the throttling
 // state is guarded by mu.
@@ -79,21 +124,21 @@ func (p *uploadProgress) Chunk(ctx context.Context, state uploader.ProgressState
 	if percent > 100 {
 		percent = 100
 	}
+	finished := percent == 100
 
 	// Throttle both update channels to once per 1.5 seconds (or immediately
 	// at 100%). The read-and-set of lastUpdate must be atomic across
 	// threads, otherwise each thread sees a stale timestamp and N duplicate
 	// edits race for the same message.
 	p.mu.Lock()
-	dbDue := percent == 100 || time.Since(p.lastUpdate) > 1500*time.Millisecond
-	msgDue := time.Since(p.lastUpdate) > 1500*time.Millisecond
-	if msgDue {
+	due := finished || time.Since(p.lastUpdate) > 1500*time.Millisecond
+	if due {
 		p.lastUpdate = time.Now()
 	}
 	p.mu.Unlock()
 
 	// Update job status in database (throttled to once per 1.5s, or when finished at 100%)
-	if dbDue {
+	if due {
 		db.DB.Model(p.job).Updates(map[string]interface{}{
 			"progress": percent,
 			"message":  fmt.Sprintf("Uploading: %s / %s (%d%%)", formatFileSize(state.Uploaded), formatFileSize(state.Total), percent),
@@ -101,7 +146,16 @@ func (p *uploadProgress) Chunk(ctx context.Context, state uploader.ProgressState
 	}
 
 	// Throttle Telegram status message updates (max once per 1.5 seconds) to avoid rate limits
-	if !msgDue {
+	if !due {
+		return nil
+	}
+
+	// Telegram messaging needs far gentler pacing than the database: all
+	// progress edits share one process-wide slot and are skipped entirely
+	// (never queued) while a messaging flood cooldown is active — see
+	// progressEditAllowed. A stale percentage for a few minutes is much
+	// better than prolonging a ban that also blocks the media post.
+	if !progressEditAllowed(finished) {
 		return nil
 	}
 
@@ -113,14 +167,21 @@ func (p *uploadProgress) Chunk(ctx context.Context, state uploader.ProgressState
 
 	progressText := formatUploadProgressHTML(p.fileName, state.Uploaded, state.Total, percent, speed, elapsed)
 
-	if p.progressMsg != nil && p.eng.Bot != nil {
-		_, _ = p.eng.Bot.Edit(p.progressMsg, progressText, &tele.SendOptions{
-			ParseMode:   tele.ModeHTML,
-			ReplyMarkup: restartJobMarkupBot(p.job.ID),
-		})
-	} else if p.gotdClient != nil && p.gotdPeer != nil && p.gotdMsgID != 0 {
-		_ = editGotdMessageHTML(ctx, floodSafeClient("upload-progress-edit", p.gotdClient), p.gotdPeer, p.gotdMsgID, progressText, restartJobMarkupGotd(p.job.ID))
-	}
+	// The edit runs in the background: the calling thread belongs to the
+	// uploader's transfer loop and must never wait on a messaging RPC (a
+	// blocked edit behind a cooldown would stall the transfer). At most one
+	// edit goes out per shared slot interval, and a failure here is purely
+	// cosmetic, so errors are ignored as before.
+	go func() {
+		if p.progressMsg != nil && p.eng.Bot != nil {
+			_, _ = p.eng.Bot.Edit(p.progressMsg, progressText, &tele.SendOptions{
+				ParseMode:   tele.ModeHTML,
+				ReplyMarkup: restartJobMarkupBot(p.job.ID),
+			})
+		} else if p.gotdClient != nil && p.gotdPeer != nil && p.gotdMsgID != 0 {
+			_ = editGotdMessageHTML(ctx, floodSafeClient("upload-progress-edit", p.gotdClient), p.gotdPeer, p.gotdMsgID, progressText, restartJobMarkupGotd(p.job.ID))
+		}
+	}()
 	return nil
 }
 
@@ -982,6 +1043,14 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 
 		// Throttle updates
 		if time.Since(lastUpdate) > 1500*time.Millisecond {
+			// Progress edits share the process-wide edit slot with uploads
+			// and are skipped entirely (never queued) while a messaging
+			// flood cooldown is active — see progressEditAllowed. The edit
+			// also runs in the background so the download callback never
+			// waits on a messaging RPC.
+			if !progressEditAllowed(false) {
+				return
+			}
 			lastUpdate = time.Now()
 			elapsed := time.Since(startTime).Seconds()
 			speed := 0.0
@@ -990,14 +1059,16 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 			}
 			progressText := formatDownloadProgressHTML(fileName, downloaded, total, percent, speed, elapsed)
 
-			if progressMsg != nil && eng.Bot != nil {
-				_, _ = eng.Bot.Edit(progressMsg, progressText, &tele.SendOptions{
-					ParseMode:   tele.ModeHTML,
-					ReplyMarkup: restartJobMarkupBot(job.ID),
-				})
-			} else if pMsgID != 0 {
-				_ = editGotdMessageHTML(eng.gotdCtx, api, peer, pMsgID, progressText, restartJobMarkupGotd(job.ID))
-			}
+			go func() {
+				if progressMsg != nil && eng.Bot != nil {
+					_, _ = eng.Bot.Edit(progressMsg, progressText, &tele.SendOptions{
+						ParseMode:   tele.ModeHTML,
+						ReplyMarkup: restartJobMarkupBot(job.ID),
+					})
+				} else if pMsgID != 0 {
+					_ = editGotdMessageHTML(eng.gotdCtx, api, peer, pMsgID, progressText, restartJobMarkupGotd(job.ID))
+				}
+			}()
 		}
 	}
 

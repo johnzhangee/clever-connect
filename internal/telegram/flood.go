@@ -271,6 +271,15 @@ var floodSendMethods = []string{
 	"MessagesSendMessage",
 }
 
+// floodEditMethods are the flood-gate keys of the messaging RPCs that render
+// live progress (progress-message edits plus the initial status message).
+// Progress edits are cosmetic: while any of these methods is under a flood
+// cooldown, transfer callbacks skip them entirely instead of queueing — a
+// herd of queued edits fired the moment a ban expires would re-trigger and
+// escalate it (that is how one incident reached a 27-minute edit ban that
+// froze every progress display and blocked every pending media post).
+var floodEditMethods = []string{"MessagesEditMessage", "MessagesSendMessage"}
+
 // runFloodTolerant runs one job phase (fn) and, if it fails with a FLOOD_WAIT
 // that exceeded the automatic per-call cap, waits out the shared cooldown and
 // re-runs the phase — without consuming the scheduler's retry budget or
