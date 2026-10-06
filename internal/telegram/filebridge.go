@@ -367,11 +367,12 @@ func formatFileSize(bytes int64) string {
 // Inspired by devgagantools ParallelTransferrer
 // ──────────────────────────────────────────────────────────────
 
-// calculateOptimalThreads determines the optimal number of concurrent download
-// threads based on file size. Each thread issues 512KB upload.getFile requests
-// over its own pooled MTProto connection, so throughput scales nearly linearly
-// with the thread count. Telegram tolerates ~16 parallel connections per
-// session, which is the practical ceiling:
+// calculateOptimalThreads determines the optimal number of concurrent transfer
+// threads based on file size, shared by both the download and the upload
+// paths. Each thread issues 512KB requests over its own pooled MTProto
+// connection, so throughput scales nearly linearly with the thread count.
+// Telegram tolerates ~16 parallel connections per session, which is the
+// practical ceiling:
 //   - Files < 50MB    → 2 threads
 //   - Files 50-200MB  → 4 threads
 //   - Files 200-500MB → 8 threads
@@ -424,11 +425,16 @@ func isPoolFailure(err error) bool {
 		strings.Contains(msg, "engine forcibly closed")
 }
 
-// UploadFile uploads a file to Telegram the standard way: sequentially, one
-// 512KB part at a time, over the engine's single primary MTProto connection.
-// There is deliberately no parallel multi-connection uploader here — parallel
-// connections and upload pools caused constant pool/DC failures, so uploads
-// use plain gotd uploader semantics with threads fixed at 1.
+// UploadFile uploads a file to Telegram using parallel multi-connection
+// transfers, mirroring the FastDownloadFile architecture: the gotd uploader
+// pushes 512KB parts with N concurrent goroutines (N from
+// calculateOptimalThreads), and each concurrent part request is served by
+// its own connection from a cached pool of extra connections on the
+// session's datacenter — the "multiple parallel call queues linked to
+// separate TCP connections" that Telegram's API documentation recommends for
+// large uploads. A pooled connection shares the session's authorization key
+// (no export/import transfer is involved), carries no updates, and every
+// part goes to the same datacenter as the primary connection.
 //
 // Robustness: each upload.saveBigFilePart request (an idempotent RPC)
 // transparently retries transient transport failures (broken pipes, dead
@@ -438,9 +444,13 @@ func isPoolFailure(err error) bool {
 // It also handles FLOOD_WAIT: a rate-limited part request waits out the
 // shared, process-wide flood gate (coordinated with every other concurrent
 // upload/download) and retries the same part — progress is never lost, and
-// no job re-triggers a flood another job is already waiting out. Larger
-// failures (e.g. a very long flood or a long engine outage) surface to the
-// caller and the job/scheduler retries.
+// no job re-triggers a flood another job is already waiting out.
+//
+// If the pooled transfers keep failing (dead pool, sustained connection
+// problems), the upload falls back to the original sequential path — one
+// 512KB part at a time over the primary connection. Larger failures (e.g. a
+// very long flood or a long engine outage) surface to the caller and the
+// job/scheduler retries.
 //
 // The progress parameter is optional — pass nil to skip progress tracking.
 func UploadFile(ctx context.Context, client *telegram.Client, filePath string, progress uploader.Progress) (tg.InputFileClass, error) {
@@ -449,22 +459,139 @@ func UploadFile(ctx context.Context, client *telegram.Client, filePath string, p
 		return nil, fmt.Errorf("file not found: %w", err)
 	}
 
-	logger.Info("Telegram", "Starting standard sequential upload",
+	// The upload API resolves its underlying connection per request: while
+	// "pooled" is true, requests are served from the cached multi-connection
+	// upload pool (the fast path); when the pool turns out to be unworkable,
+	// the same invoker degrades transparently to the engine's primary
+	// connection. The retrying invoker re-resolves the live engine's client
+	// on every attempt, so an engine (or client) restart mid-upload switches
+	// to the new client without losing progress.
+	pooled := true
+	newUploadAPI := func() *tg.Client {
+		return tg.NewClient(newRetryingInvoker("upload",
+			func() (tg.Invoker, error) {
+				c := liveClient(client)
+				if c == nil {
+					return nil, fmt.Errorf("no MTProto client available")
+				}
+				if pooled {
+					pool, poolErr := getUploadPool(c, uploadPoolMaxConns)
+					if poolErr == nil {
+						return pool, nil
+					}
+					logger.Warn("Telegram", "Failed to create upload pool, using primary connection",
+						"error", poolErr)
+				}
+				return c, nil
+			},
+			func(error) {
+				if c := liveClient(client); c != nil {
+					evictUploadPool(c)
+				}
+			},
+		))
+	}
+
+	threads := calculateOptimalThreads(info.Size())
+	logger.Info("Telegram", "Starting parallel multi-connection upload",
 		"file", filepath.Base(filePath),
 		"size", formatFileSize(info.Size()),
+		"threads", threads,
 	)
 
-	// Per-part transient retries over the primary connection. The invoker
-	// re-resolves the live engine's client on every attempt, so an engine
-	// (or client) restart mid-upload switches to the new client without
-	// losing progress.
-	uploadInvoker := newRetryingInvoker("upload",
-		func() (tg.Invoker, error) { return liveClient(client), nil },
-		nil,
-	)
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("upload cancelled: %w", ctx.Err())
+		default:
+		}
 
-	up := uploader.NewUploader(tg.NewClient(uploadInvoker)).
-		WithThreads(1).          // explicitly sequential — no parallel connections
+		if attempt > 0 {
+			backoff := time.Duration(1<<uint(attempt)) * time.Second
+			logger.Warn("Telegram", "Retrying upload over a fresh file ID",
+				"attempt", attempt+1,
+				"threads", threads,
+				"backoff", backoff.String(),
+				"error", lastErr,
+			)
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("upload cancelled during backoff: %w", ctx.Err())
+			case <-time.After(backoff):
+			}
+		}
+
+		inputFile, err := doUpload(ctx, newUploadAPI(), filePath, threads, progress)
+		lastErr = err
+		if lastErr == nil {
+			logger.Info("Telegram", "Upload completed",
+				"file", filepath.Base(filePath),
+				"size", formatFileSize(info.Size()),
+				"attempt", attempt+1,
+			)
+			return inputFile, nil
+		}
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("upload cancelled: %w", ctx.Err())
+		}
+
+		logger.Warn("Telegram", "Parallel upload attempt failed",
+			"attempt", attempt+1,
+			"threads", threads,
+			"error", lastErr,
+		)
+
+		// A pool that died outright (mid-request or stale from a previous
+		// engine run) surfaces as an "invoke pool" / "DC closed" error after
+		// per-request retries were exhausted. Evict the poisoned pool and
+		// continue over the primary connection.
+		if pooled && isPoolFailure(lastErr) {
+			logger.Warn("Telegram", "Upload pool died mid-transfer, evicting cached pool",
+				"error", lastErr)
+			if c := liveClient(client); c != nil {
+				evictUploadPool(c)
+			}
+			pooled = false
+		}
+
+		// Reduce threads for next attempt
+		threads = threads / 2
+		if threads < 1 {
+			threads = 1
+		}
+	}
+
+	// Final fallback: sequential upload — single goroutine, one 512KB part
+	// at a time, over the engine's primary connection (bypassing any pool).
+	// Slow but reliable: this is the original pre-parallel behavior, and it
+	// succeeds whenever the old code did.
+	logger.Warn("Telegram", "Falling back to sequential single-connection upload",
+		"file", filepath.Base(filePath),
+		"error", lastErr,
+	)
+	pooled = false
+	fallbackFile, seqErr := doUpload(ctx, newUploadAPI(), filePath, 1, progress)
+	if seqErr == nil {
+		logger.Info("Telegram", "Sequential fallback upload completed",
+			"file", filepath.Base(filePath),
+			"size", formatFileSize(info.Size()),
+		)
+		return fallbackFile, nil
+	}
+
+	return nil, fmt.Errorf("upload failed after 3 parallel attempts (last error: %v) and sequential fallback: %w",
+		lastErr, seqErr)
+}
+
+// doUpload runs one full upload attempt: the gotd uploader pushes 512KB
+// parts with threads concurrent goroutines, and — when the API client is
+// backed by the connection pool — each concurrent part request is served by
+// its own MTProto connection, which is what makes the transfer parallel.
+// threads=1 over the primary connection is the legacy sequential path.
+func doUpload(ctx context.Context, api *tg.Client, filePath string, threads int, progress uploader.Progress) (tg.InputFileClass, error) {
+	up := uploader.NewUploader(api).
+		WithThreads(threads).
 		WithPartSize(512 * 1024) // 512KB parts — Telegram's maximum
 
 	if progress != nil {
@@ -473,15 +600,61 @@ func UploadFile(ctx context.Context, client *telegram.Client, filePath string, p
 
 	inputFile, err := up.FromPath(ctx, filePath)
 	if err != nil {
-		return nil, fmt.Errorf("upload failed: %w", err)
+		return nil, fmt.Errorf("upload attempt failed (threads=%d): %w", threads, err)
+	}
+	return inputFile, nil
+}
+
+// uploadPoolMaxConns is the number of MTProto connections opened on the
+// session's datacenter for uploads. This mirrors downloadPoolMaxConns:
+// Telegram tolerates ~16 parallel connections per session, and a single
+// connection can only push one 512KB-part round-trip at a time — extra
+// connections are the single biggest upload speed lever.
+const uploadPoolMaxConns = 16
+
+// dcUploadPools caches multi-connection upload invokers per owning MTProto
+// client. client.Pool() always targets the session's *current* datacenter,
+// so unlike download pools no datacenter id is needed in the key — but the
+// client *instance* is: the engine can be restarted dynamically, and the old
+// client's pools die with it.
+var dcUploadPools sync.Map // map[*telegram.Client]telegram.CloseInvoker
+
+// getUploadPool returns a cached multi-connection invoker for uploads on the
+// session's current datacenter. client.Pool() dials up to max extra
+// data-mode connections (lazily, as upload threads request them) over the
+// session's existing authorization key without carrying updates — the
+// dedicated file-transfer connections Telegram's API documentation
+// prescribes for large transfers. No export/import authorization transfer is
+// involved because the target is the session's own datacenter. Pools are
+// created once and reused across uploads: re-creating one per transfer
+// caused the connection storms and pool/DC failures that originally led to
+// uploads being restricted to a single connection.
+func getUploadPool(client *telegram.Client, max int) (telegram.CloseInvoker, error) {
+	dcPoolMu.Lock()
+	defer dcPoolMu.Unlock()
+
+	if v, ok := dcUploadPools.Load(client); ok {
+		return v.(telegram.CloseInvoker), nil
 	}
 
-	logger.Info("Telegram", "Upload completed",
-		"file", filepath.Base(filePath),
-		"size", formatFileSize(info.Size()),
-	)
+	pool, err := client.Pool(int64(max))
+	if err != nil {
+		return nil, fmt.Errorf("create upload pool: %w", err)
+	}
 
-	return inputFile, nil
+	dcUploadPools.Store(client, pool)
+	return pool, nil
+}
+
+// evictUploadPool drops a cached upload pool whose connections have gone bad
+// ("invoke pool: engine forcibly closed" mid-request, or a stale pool from a
+// restarted engine) so the next upload creates a fresh pool with new
+// connections. The old pool is intentionally NOT closed: a concurrent upload
+// may still be using it, and pool.Close would cancel its in-flight requests.
+// The abandoned pool is bound to the client's lifetime context, so the engine
+// shuts it down automatically.
+func evictUploadPool(client *telegram.Client) {
+	dcUploadPools.Delete(client)
 }
 
 // downloadPoolMaxConns is the number of MTProto connections opened per Telegram

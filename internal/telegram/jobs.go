@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"clever-connect/internal/config"
@@ -47,14 +48,21 @@ type TelegramUploadPayload struct {
 }
 
 // uploadProgress tracks the upload progress and throttles Telegram updates.
+// Chunk is invoked concurrently by every upload thread, so the throttling
+// state is guarded by mu.
 type uploadProgress struct {
 	job         *models.SchedulerJob
 	eng         *Engine
 	progressMsg *tele.Message
 	fileName    string
 	startTime   time.Time
-	lastUpdate  time.Time
-	logFn       func(level, message string)
+
+	// mu guards lastUpdate: with parallel uploads, all N threads call Chunk
+	// concurrently and must agree on when the last update was sent.
+	mu         sync.Mutex
+	lastUpdate time.Time
+
+	logFn func(level, message string)
 
 	// gotd message update support
 	gotdClient *telegram.Client
@@ -62,15 +70,30 @@ type uploadProgress struct {
 	gotdMsgID  int
 }
 
-// Chunk satisfies the uploader.Progress interface.
+// Chunk satisfies the uploader.Progress interface. Every concurrent upload
+// thread calls it, so the shared throttle timestamp is updated atomically;
+// the database write and message edit run outside the lock so a slow update
+// never stalls the other threads.
 func (p *uploadProgress) Chunk(ctx context.Context, state uploader.ProgressState) error {
 	percent := int(100 * float64(state.Uploaded) / float64(state.Total))
 	if percent > 100 {
 		percent = 100
 	}
 
+	// Throttle both update channels to once per 1.5 seconds (or immediately
+	// at 100%). The read-and-set of lastUpdate must be atomic across
+	// threads, otherwise each thread sees a stale timestamp and N duplicate
+	// edits race for the same message.
+	p.mu.Lock()
+	dbDue := percent == 100 || time.Since(p.lastUpdate) > 1500*time.Millisecond
+	msgDue := time.Since(p.lastUpdate) > 1500*time.Millisecond
+	if msgDue {
+		p.lastUpdate = time.Now()
+	}
+	p.mu.Unlock()
+
 	// Update job status in database (throttled to once per 1.5s, or when finished at 100%)
-	if percent == 100 || time.Since(p.lastUpdate) > 1500*time.Millisecond {
+	if dbDue {
 		db.DB.Model(p.job).Updates(map[string]interface{}{
 			"progress": percent,
 			"message":  fmt.Sprintf("Uploading: %s / %s (%d%%)", formatFileSize(state.Uploaded), formatFileSize(state.Total), percent),
@@ -78,31 +101,31 @@ func (p *uploadProgress) Chunk(ctx context.Context, state uploader.ProgressState
 	}
 
 	// Throttle Telegram status message updates (max once per 1.5 seconds) to avoid rate limits
-	if time.Since(p.lastUpdate) > 1500*time.Millisecond {
-		p.lastUpdate = time.Now()
+	if !msgDue {
+		return nil
+	}
 
-		elapsed := time.Since(p.startTime).Seconds()
-		speed := 0.0
-		if elapsed > 0 {
-			speed = float64(state.Uploaded) / elapsed / (1024 * 1024) // MB/s
-		}
+	elapsed := time.Since(p.startTime).Seconds()
+	speed := 0.0
+	if elapsed > 0 {
+		speed = float64(state.Uploaded) / elapsed / (1024 * 1024) // MB/s
+	}
 
-		progressText := formatUploadProgressHTML(p.fileName, state.Uploaded, state.Total, percent, speed, elapsed)
+	progressText := formatUploadProgressHTML(p.fileName, state.Uploaded, state.Total, percent, speed, elapsed)
 
-		if p.progressMsg != nil && p.eng.Bot != nil {
-			_, _ = p.eng.Bot.Edit(p.progressMsg, progressText, &tele.SendOptions{
-				ParseMode:   tele.ModeHTML,
-				ReplyMarkup: restartJobMarkupBot(p.job.ID),
-			})
-		} else if p.gotdClient != nil && p.gotdPeer != nil && p.gotdMsgID != 0 {
-			_ = editGotdMessageHTML(ctx, floodSafeClient("upload-progress-edit", p.gotdClient), p.gotdPeer, p.gotdMsgID, progressText, restartJobMarkupGotd(p.job.ID))
-		}
+	if p.progressMsg != nil && p.eng.Bot != nil {
+		_, _ = p.eng.Bot.Edit(p.progressMsg, progressText, &tele.SendOptions{
+			ParseMode:   tele.ModeHTML,
+			ReplyMarkup: restartJobMarkupBot(p.job.ID),
+		})
+	} else if p.gotdClient != nil && p.gotdPeer != nil && p.gotdMsgID != 0 {
+		_ = editGotdMessageHTML(ctx, floodSafeClient("upload-progress-edit", p.gotdClient), p.gotdPeer, p.gotdMsgID, progressText, restartJobMarkupGotd(p.job.ID))
 	}
 	return nil
 }
 
-// RunTelegramUploadJob executes a standard sequential file upload to Telegram
-// over the engine's primary MTProto connection.
+// RunTelegramUploadJob executes a standard file upload to Telegram using
+// parallel multi-connection transfers.
 func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn func(level, message string)) error {
 	logFn("INFO", "Telegram upload job started")
 
@@ -293,7 +316,7 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 		gotdMsgID:   pMsgID,
 	}
 
-	logFn("INFO", "Uploading file sequentially over the primary MTProto connection...")
+	logFn("INFO", "Uploading file over parallel MTProto connections...")
 
 	// The upload phase is flood-tolerant: part-level FLOOD_WAITs are waited
 	// out transparently by the retrying invoker (and coordinated across all

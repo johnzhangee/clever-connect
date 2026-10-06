@@ -20,7 +20,6 @@ import (
 	"github.com/gotd/td/telegram/message"
 	"github.com/gotd/td/telegram/message/html"
 	"github.com/gotd/td/telegram/message/styling"
-	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
 	tele "gopkg.in/telebot.v4"
 )
@@ -677,13 +676,15 @@ func (e *Engine) sendFileToChatUser(ctx context.Context, entities tg.Entities, p
 	}
 
 	inputPeer := getPeerInput(peer, entities)
-	// Upload part requests are idempotent — retry transient transport
-	// failures (dead connections) on fresh connections.
+	// Send requests are retried on fresh connections the same way as the
+	// upload below (transient transport failures only).
 	api := tg.NewClient(newRetryingInvoker("command-upload",
 		func() (tg.Invoker, error) { return liveClient(e.currentClient()), nil }, nil))
-	up := uploader.NewUploader(api)
 
-	fileObj, err := up.FromPath(ctx, safePath)
+	// Upload through the shared fast multi-connection uploader — the same
+	// code path the scheduled upload jobs use — then send the result with
+	// the command API client.
+	fileObj, err := UploadFile(ctx, e.currentClient(), safePath, nil)
 	if err != nil {
 		return e.sendUserMessage(ctx, entities, peer, "❌ Failed to upload file: "+err.Error())
 	}
